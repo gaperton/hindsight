@@ -19,6 +19,7 @@ from benchmarks.common.benchmark_runner import (
     BenchmarkRunner,
     LLMAnswerEvaluator,
     LLMAnswerGenerator,
+    format_context_structured,
 )
 
 
@@ -108,12 +109,21 @@ class QuestionAnswer(pydantic.BaseModel):
 class LoComoAnswerGenerator(LLMAnswerGenerator):
     """LoComo-specific answer generator using configurable LLM provider."""
 
-    def __init__(self):
+    def __init__(self, context_format: str = "json"):
         """Initialize with LLM configuration for answer generation.
 
         Uses HINDSIGHT_API_ANSWER_LLM_* env vars with fallback to HINDSIGHT_API_LLM_* for
         benchmark-specific LLM configuration (separate from the API config system).
+
+        Args:
+            context_format: How the retrieved context is rendered into the prompt.
+                "json" dumps the whole RecallResult (original behaviour); "structured"
+                renders just the facts, their timing and source chunks as text. The
+                JSON envelope is most of the prompt -- measured on conv-26, ~12k
+                tokens of selected content arrived as ~42k tokens of prompt -- so
+                "structured" cuts answer-generation prefill several-fold.
         """
+        self.context_format = context_format
         self.llm_config = LLMConfig(
             provider=os.getenv("HINDSIGHT_API_ANSWER_LLM_PROVIDER", os.getenv("HINDSIGHT_API_LLM_PROVIDER", "openai")),
             api_key=os.getenv("HINDSIGHT_API_ANSWER_LLM_API_KEY", os.getenv("HINDSIGHT_API_LLM_API_KEY", "")),
@@ -145,7 +155,10 @@ class LoComoAnswerGenerator(LLMAnswerGenerator):
             Tuple of (answer, reasoning, None)
             - None indicates to use the memories from recall_result
         """
-        context = json.dumps(recall_result)
+        if self.context_format == "structured":
+            context = format_context_structured(recall_result)
+        else:
+            context = json.dumps(recall_result)
 
         # Format question date if provided
         question_date_str = ""
@@ -306,6 +319,9 @@ async def run_benchmark(
     wait_consolidation: bool = False,
     template_path: str = None,
     bank_archive: str = None,
+    context_format: str = "json",
+    results_filename: str = None,
+    eval_concurrency: int = None,
 ):
     """
     Run the LoComo benchmark.
@@ -386,14 +402,18 @@ async def run_benchmark(
         console.print("[blue]Mode: reflect (using reflect API)[/blue]")
         answer_generator = LoComoReflectAnswerGenerator(memory=memory)
         max_concurrent_questions = max_concurrent_questions_override or 4
-        eval_semaphore_size = 4
+        eval_semaphore_size = eval_concurrency or 4
     else:
         console.print("[blue]Mode: recall+LLM (traditional)[/blue]")
-        answer_generator = LoComoAnswerGenerator()
+        console.print(f"[blue]Context format: {context_format}[/blue]")
+        answer_generator = LoComoAnswerGenerator(context_format=context_format)
         # Reduced from 32 to 10 to match search semaphore limit
         # Prevents "too many connections" errors
         max_concurrent_questions = max_concurrent_questions_override or 10
-        eval_semaphore_size = 8
+        # Judge concurrency. Must not exceed the judge server's slot count: the
+        # harness fires these in parallel, and anything above the slots only builds
+        # queue, which Hindsight bills to each call's duration_ms.
+        eval_semaphore_size = eval_concurrency or 8
 
     answer_evaluator = LLMAnswerEvaluator()
 
@@ -436,9 +456,11 @@ async def run_benchmark(
 
         dataset.get_qa_pairs = filtered_get_qa_pairs
 
-    # Determine output filename based on mode
+    # Determine output filename based on mode. An explicit results_filename lets
+    # A/B runs coexist -- the default name is fixed, so a variant run would
+    # otherwise overwrite the baseline it is meant to be compared against.
     suffix = "_reflect" if use_reflect else ""
-    results_filename = f"benchmark_results{suffix}.json"
+    results_filename = results_filename or f"benchmark_results{suffix}.json"
     output_path = Path(__file__).parent / "results" / results_filename
 
     # Create results directory if it doesn't exist
@@ -629,6 +651,20 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--context-format",
+        type=str,
+        choices=["json", "structured"],
+        default="json",
+        help=(
+            "How retrieved context is rendered into the answer prompt. 'json' dumps the whole "
+            "RecallResult (original behaviour); 'structured' renders facts, timing and source "
+            "chunks as text. The JSON envelope dominates the prompt — measured on conv-26, ~12k "
+            "tokens of selected content became ~42k tokens of prompt — so 'structured' cuts "
+            "answer-generation prefill several-fold. Default: json."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Validate that only one of --only-failed or --only-invalid is set
@@ -650,5 +686,6 @@ if __name__ == "__main__":
             wait_consolidation=args.wait_consolidation,
             template_path=args.template,
             bank_archive=args.bank_archive,
+            context_format=args.context_format,
         )
     )

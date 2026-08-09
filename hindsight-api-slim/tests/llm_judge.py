@@ -49,6 +49,13 @@ _JUDGE_CONFIRM_TEMPERATURE = float(os.getenv("HINDSIGHT_TEST_JUDGE_CONFIRM_TEMPE
 # Retry transient judge-call errors (rate limits, 5xx) so judge infrastructure
 # hiccups never fail the test under evaluation.
 _JUDGE_CALL_ATTEMPTS = int(os.getenv("HINDSIGHT_TEST_JUDGE_CALL_ATTEMPTS", "3"))
+# Output budget for one judge call. 256 is plenty for the {meets_criteria, reasoning}
+# verdict itself and stays the default, but a *reasoning* judge spends this budget on
+# its thinking tokens first: a local gemma-4-31B with no reasoning-budget configured
+# burns all 256 on reasoning_content and returns empty content with
+# finish_reason=length, which the provider surfaces as "empty message content" and
+# retries fruitlessly. Raise this when pointing the judge at such a model.
+_JUDGE_MAX_TOKENS = int(os.getenv("HINDSIGHT_TEST_JUDGE_MAX_TOKENS", "256"))
 
 
 class JudgeVerdict(BaseModel):
@@ -107,7 +114,7 @@ async def _judge_once(
             result = await judge.call(
                 messages=messages,
                 response_format=JudgeVerdict,
-                max_completion_tokens=256,
+                max_completion_tokens=_JUDGE_MAX_TOKENS,
                 temperature=temperature,
                 scope="test_judge",
             )

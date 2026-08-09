@@ -23,8 +23,7 @@ node_modules/
 
 # Environment variables and local config
 .env
-.env.bak*
-.env.*.bak
+.env.*
 docker-compose.yml
 docker-compose.override.yml
 

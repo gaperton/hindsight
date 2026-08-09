@@ -119,6 +119,80 @@ async def create_memory_engine() -> MemoryEngine:
     return memory
 
 
+def format_context_structured(recall_result: Dict[str, Any]) -> str:
+    """Render a RecallResult as compact human-readable text for the answer prompt.
+
+    The alternative -- ``json.dumps(recall_result)`` -- ships the whole envelope
+    (field names, ids, scores, trace) to the model. Measured on LoCoMo conv-26,
+    that turned ~12k tokens of selected content (4,083 fact + 8,192 chunk) into
+    ~42k tokens of prompt, and since answer generation dominates the QA phase's
+    wall clock, most of a run was spent prefilling JSON syntax.
+
+    Format:
+        Fact 1 (world): [fact text]
+        When: occurred: ... | mentioned: ...
+        Source chunk:
+          "[chunk text]"
+
+        ---
+
+        === Entity Observations ===
+        Entity: [name]
+          - [observation]
+    """
+    # `or` rather than a .get default: these keys are present-but-null on some
+    # recall paths (e.g. chunks when nothing carried a source chunk), and a
+    # default only applies to a *missing* key.
+    results = recall_result.get("results") or []
+    chunks = recall_result.get("chunks") or {}
+    entities = recall_result.get("entities") or {}
+
+    if not results and not entities:
+        return "No memories found."
+
+    formatted_parts = []
+
+    for i, fact in enumerate(results, 1):
+        fact_text = fact.get("text", "")
+        fact_type = fact.get("fact_type", "unknown")
+
+        when_parts = []
+        if fact.get("occurred_start"):
+            when_parts.append(f"occurred: {fact['occurred_start']}")
+        if fact.get("mentioned_at"):
+            when_parts.append(f"mentioned: {fact['mentioned_at']}")
+        when_str = " | ".join(when_parts) if when_parts else "unknown"
+
+        entry_parts = [f"Fact {i} ({fact_type}): {fact_text}", f"When: {when_str}"]
+
+        context = fact.get("context")
+        if context:
+            entry_parts.append(f"Context: {context}")
+
+        chunk_id = fact.get("chunk_id")
+        if chunk_id and chunk_id in chunks:
+            chunk_text = chunks[chunk_id].get("chunk_text", "")
+            if chunk_text:
+                if len(chunk_text) > 1000:
+                    chunk_text = chunk_text[:1000] + "..."
+                entry_parts.append(f'Source chunk:\n  "{chunk_text}"')
+
+        formatted_parts.append("\n".join(entry_parts))
+
+    if entities:
+        entity_parts = ["=== Entity Observations ==="]
+        for entity_name, entity_state in entities.items():
+            observations = entity_state.get("observations", [])
+            if observations:
+                entity_parts.append(f"\nEntity: {entity_name}")
+                for obs in observations:
+                    entity_parts.append(f"  - {obs.get('text', '')}")
+        if len(entity_parts) > 1:  # more than just the header
+            formatted_parts.append("\n".join(entity_parts))
+
+    return "\n\n---\n\n".join(formatted_parts)
+
+
 class BenchmarkDataset(ABC):
     """Abstract base class for benchmark datasets."""
 
@@ -585,34 +659,106 @@ class BenchmarkRunner:
             )
             return result["count"] if result else 0
 
-    async def _wait_for_consolidation(self, bank_id: str, poll_interval: float = 2.0, timeout: float = 3000.0) -> None:
+    async def _get_active_consolidation_ops(self, bank_id: str) -> int:
+        """Count consolidation operations for this bank that are not in a terminal state.
+
+        Returns -1 when the operations table is unavailable (non-PG backend, older
+        schema), so callers can fall back to the pending-count signal alone.
         """
-        Wait for consolidation to complete (pending_consolidation reaches 0).
+        pool = await self.memory._get_pool()
+        from hindsight_api.engine.memory_engine import fq_table
+
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM {fq_table("async_operations")}
+                    WHERE bank_id = $1
+                      AND operation_type = 'consolidation'
+                      AND status NOT IN ('completed', 'failed', 'cancelled')
+                    """,
+                    bank_id,
+                )
+                return row["count"] if row else 0
+        except Exception:
+            return -1
+
+    async def _wait_for_consolidation(
+        self,
+        bank_id: str,
+        poll_interval: float = 2.0,
+        timeout: float = 3000.0,
+        quiet_for: float = 20.0,
+    ) -> None:
+        """Wait until consolidation is genuinely finished, then settle.
+
+        Waiting only for ``pending_consolidation == 0`` is NOT enough, and getting
+        this wrong silently destroys a run. Facts are stamped ``consolidated_at``
+        while the job is still writing the observations derived from them, and
+        those writes stay "durable-but-invisible" until each batch commits (see
+        ``consolidation/consolidator.py``). QA starting in that window recalls a
+        bank whose facts are already filtered out and whose observations are not
+        yet visible -- retrieval returns nothing and nearly every answer becomes
+        "I don't have enough information". Observed: a gemma run scored 8% purely
+        from this race, and the concurrent load also made consolidation calls take
+        36-48s instead of the 10-14s they take uncontended.
+
+        Consolidation also *cascades*: finishing one operation can enqueue another
+        (observed 02:07 and 02:10 ops completing at 02:37, with a fresh op created
+        at 02:37). So this waits on three conditions together:
+
+        1. no non-terminal consolidation operation for the bank,
+        2. zero unconsolidated facts,
+        3. both of the above continuously true for ``quiet_for`` seconds, so a
+           newly enqueued cascade op is caught rather than raced past.
 
         Args:
             bank_id: Bank ID to check
             poll_interval: Seconds between polls
             timeout: Maximum seconds to wait
+            quiet_for: Seconds the "done" condition must hold before returning
 
         Raises:
-            TimeoutError: If consolidation doesn't complete within timeout
+            TimeoutError: If consolidation doesn't settle within timeout
         """
         import time
 
         start_time = time.time()
         console.print("      [yellow]Waiting for consolidation to complete...[/yellow]")
 
+        quiet_since: Optional[float] = None
+        ops_supported = True
+
         while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                raise TimeoutError(f"Consolidation did not complete within {timeout}s")
+            now = time.time()
+            if now - start_time > timeout:
+                raise TimeoutError(
+                    f"Consolidation did not settle within {timeout}s "
+                    f"(pending={await self._get_pending_consolidation_count(bank_id)})"
+                )
 
             pending = await self._get_pending_consolidation_count(bank_id)
-            if pending == 0:
-                console.print("      [green]✓[/green] Consolidation complete")
-                return
+            active_ops = await self._get_active_consolidation_ops(bank_id) if ops_supported else -1
+            if active_ops == -1:
+                if ops_supported:
+                    console.print(
+                        "      [yellow]note:[/yellow] operations table unavailable; "
+                        "falling back to pending-count only (weaker signal)"
+                    )
+                ops_supported = False
+                active_ops = 0
 
-            # Still pending, wait and poll again
+            if pending == 0 and active_ops == 0:
+                if quiet_since is None:
+                    quiet_since = now
+                elif now - quiet_since >= quiet_for:
+                    console.print(f"      [green]✓[/green] Consolidation complete (settled {quiet_for:.0f}s)")
+                    return
+            else:
+                # Any new work resets the settle timer -- this is the cascade guard.
+                quiet_since = None
+
             await asyncio.sleep(poll_interval)
 
     async def answer_question(
