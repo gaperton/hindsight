@@ -20,8 +20,10 @@ Columns, and why each exists:
     acquiring the concurrency permit, so it absorbs both queue wait and the
     slowdown from sharing the GPU. Retain read 10.8s raw at 2.0x in-flight when
     the real cost was ~5.4s.
-  * ``in-flight`` -- peers sharing the GPU, sampled at each call's own midpoint
-    (NOT sum(durations)/span, which idle gaps dilute toward a meaningless <1x).
+  * ``in-flight`` -- MEAN peers sharing the GPU, sampled at each call's own midpoint
+    (not sum(durations)/span, which idle gaps dilute toward a meaningless <1x; and
+    not the median, which snaps to integers and once turned identical concurrency
+    into a fake 2x latency gap).
   * ``calls/min`` -- throughput over ACTIVE time only, gaps between runs removed.
   * ``idle %`` -- how much of the span was idle; high values mean the rows span
     multiple runs, so use --since to isolate one.
@@ -74,7 +76,13 @@ def _median_inflight(rs: list) -> float:
     for r in rs:
         mid = r["started_at"] + (r["ended_at"] - r["started_at"]) / 2
         counts.append(bisect.bisect_right(starts, mid) - bisect.bisect_right(ends, mid))
-    return statistics.median(counts) if counts else 1.0
+    # MEAN, not median: the median is a coarse statistic on a distribution that is
+    # routinely spread across 1-4 concurrent calls, and it snaps to whole numbers.
+    # Two runs with IDENTICAL mean concurrency (2.60) reported medians of 3 vs 2
+    # purely because one had a 17/17 tie between two and three in flight; that
+    # propagated into `solo s` as a bogus 2.0s vs 3.8s gap where the truth was
+    # 2.31s vs 2.96s. The mean is what actually divides out the sharing.
+    return statistics.fmean(counts) if counts else 1.0
 
 
 def _active_seconds(rs: list) -> float:
