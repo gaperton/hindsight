@@ -5,6 +5,7 @@ details live in focused submodules.
 """
 
 from ...llm_wrapper import LLMConfig, OutputTooLongError
+from ...response_models import TokenUsage
 from ..types import ChunkMetadata, RetainContent
 from .batch import _write_batch_extraction_errors, extract_facts_from_contents_batch_api
 from .chunking import (
@@ -79,6 +80,7 @@ __all__ = [
     "OutputTooLongError",
     "RetainContent",
     "SECONDS_PER_FACT",
+    "TokenUsage",
     "VERBATIM_FACT_EXTRACTION_PROMPT",
     "VERBOSE_FACT_EXTRACTION_PROMPT",
     "VerbatimExtractedFact",
