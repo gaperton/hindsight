@@ -9,7 +9,7 @@ class overrides only the four batch members of the interface, translating that
 workflow to/from the OpenAI-batch shapes the retain orchestrator and
 ``fact_extraction`` consumer expect — so nothing downstream changes.
 
-Interface contract preserved (see ``fact_extraction.py`` result handling)::
+Interface contract preserved (see ``fact_extraction/batch.py`` result handling)::
 
     result["response"]["body"]["choices"][0]["message"]["content"]
 

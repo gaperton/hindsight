@@ -19,7 +19,6 @@ from hindsight_api.engine.retain.fact_extraction import (
     Fact,
     RetainContent,
     extract_facts_from_contents,
-    extract_facts_from_contents_batch_api,
 )
 
 
@@ -42,7 +41,7 @@ async def test_extract_facts_preserves_experience_type():
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction.extract_facts_from_text",
+        "hindsight_api.engine.retain.fact_extraction.pipeline.extract_facts_from_text",
         new=AsyncMock(return_value=([extracted_fact], [(contents[0].content, 1)], TokenUsage())),
     ):
         facts, _chunks, _usage = await extract_facts_from_contents(

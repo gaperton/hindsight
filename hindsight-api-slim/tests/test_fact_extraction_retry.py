@@ -115,7 +115,7 @@ async def test_output_too_long_drops_unsplittable_subchunk_without_recursing():
     llm_config = _make_llm_config(mock_response={})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._extract_facts_from_chunk",
+        "hindsight_api.engine.retain.fact_extraction.streaming._extract_facts_from_chunk",
         side_effect=OutputTooLongError("too long"),
     ) as extract:
         facts, usage = await _extract_facts_with_auto_split(
@@ -187,7 +187,7 @@ async def test_non_dict_json_all_retries_raises():
     llm_config = _make_llm_config(mock_response=["invalid response"])
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         with pytest.raises(RuntimeError, match="non-dict JSON"):
@@ -231,7 +231,7 @@ async def test_top_level_fact_list_is_accepted_without_retry():
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -274,7 +274,7 @@ async def test_fact_text_alias_is_recovered(fact_fields, expected_text):
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -313,7 +313,7 @@ async def test_schema_drifted_facts_are_retried_then_raise():
     llm_config = _make_llm_config(mock_response={"facts": [_drifted_fact(3), _drifted_fact(4)]})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         with pytest.raises(RuntimeError, match="all 2 facts returned by the LLM were unusable"):
@@ -348,7 +348,7 @@ async def test_schema_drifted_facts_do_not_discard_the_usable_ones():
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -381,7 +381,7 @@ async def test_placeholder_what_is_skipped_without_retry_or_raise(placeholder):
     llm_config = _make_llm_config(mock_response={"facts": [{"what": placeholder, "fact_type": "world"}]})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -408,7 +408,7 @@ async def test_empty_facts_list_is_not_treated_as_schema_drift():
     llm_config = _make_llm_config(mock_response={"facts": []})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -439,7 +439,7 @@ async def test_verbatim_mode_tolerates_facts_without_what():
     llm_config = _make_llm_config(mock_response={"facts": [{"fact_type": "world", "entities": ["Alice"]}]})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -469,7 +469,7 @@ async def test_non_dict_json_with_default_max_retries_raises():
     llm_config = _make_llm_config(mock_response="not a dict at all")
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         with pytest.raises(RuntimeError, match="non-dict JSON"):
@@ -500,7 +500,7 @@ async def test_retain_llm_max_retries_overrides_global():
     llm_config = _make_llm_config(mock_response=42)  # non-dict: integer
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         with pytest.raises(RuntimeError, match="non-dict JSON"):
@@ -534,7 +534,7 @@ async def test_zero_retry_budget_performs_single_chunk_extraction_call():
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, _usage = await _extract_facts_from_chunk(
@@ -569,7 +569,7 @@ async def test_none_event_date_with_empty_facts_no_crash():
     llm_config = _make_llm_config(mock_response={"facts": []})
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, usage = await _extract_facts_from_chunk(
@@ -610,7 +610,7 @@ async def test_none_event_date_with_valid_facts_no_crash():
     )
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._build_extraction_prompt_and_schema",
+        "hindsight_api.engine.retain.fact_extraction.streaming._build_extraction_prompt_and_schema",
         return_value=("system prompt", MagicMock()),
     ):
         facts, usage = await _extract_facts_from_chunk(
@@ -680,7 +680,7 @@ def test_build_request_body_uses_retain_strict_schema_flag_for_schema_and_reques
     response_schema.model_json_schema.return_value = {"schema": "non-strict"}
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction.strict_json_schema",
+        "hindsight_api.engine.retain.fact_extraction.prompts.strict_json_schema",
         return_value={"schema": "strict"},
     ) as strict_schema:
         body = _build_request_body(_make_batch_llm_config(), config, "sys", "user", response_schema)
@@ -700,7 +700,7 @@ def test_build_request_body_retain_strict_false_overrides_global_true():
     response_schema = MagicMock()
     response_schema.model_json_schema.return_value = {"schema": "non-strict"}
 
-    with patch("hindsight_api.engine.retain.fact_extraction.strict_json_schema") as strict_schema:
+    with patch("hindsight_api.engine.retain.fact_extraction.prompts.strict_json_schema") as strict_schema:
         body = _build_request_body(_make_batch_llm_config(), config, "sys", "user", response_schema)
 
     strict_schema.assert_not_called()

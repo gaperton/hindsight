@@ -7,7 +7,7 @@ four batch members and translates Gemini's file-upload -> ``batches.create`` ->
 ``batches.get`` -> download flow back onto the OpenAI-batch interface contract
 that the retain orchestrator + ``fact_extraction`` consumer depend on.
 
-The interface contract that MUST be preserved (see fact_extraction.py)::
+The interface contract that MUST be preserved (see fact_extraction/batch.py)::
     result["response"]["body"]["choices"][0]["message"]["content"]
 
 The pure translation/normalization helpers are unit-tested directly; the async
@@ -141,7 +141,7 @@ def test_normalize_output_line_success_preserves_contract():
     out = GeminiLLM._normalize_output_line(line)
     assert out["custom_id"] == "chunk_0"
     assert out["error"] is None
-    # The exact path fact_extraction.py reads:
+    # The exact path fact_extraction/batch.py reads:
     assert out["response"]["body"]["choices"][0]["message"]["content"] == '{"facts": []}'
 
 

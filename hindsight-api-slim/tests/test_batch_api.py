@@ -372,7 +372,7 @@ async def test_batch_api_records_schema_drifted_facts_as_extraction_errors(
         recorded.append(errors)
 
     with patch(
-        "hindsight_api.engine.retain.fact_extraction._write_batch_extraction_errors",
+        "hindsight_api.engine.retain.fact_extraction.batch._write_batch_extraction_errors",
         side_effect=_capture,
     ):
         facts, chunks, _usage = await extract_facts_from_contents_batch_api(

@@ -8,6 +8,8 @@ from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.retain import fact_extraction
 from hindsight_api.engine.retain.fact_extraction import CausalRelation, Fact
+from hindsight_api.engine.retain.fact_extraction import batch as fact_extraction_batch
+from hindsight_api.engine.retain.fact_extraction import pipeline as fact_extraction_pipeline
 from hindsight_api.engine.retain.types import RetainContent
 
 
@@ -28,9 +30,9 @@ async def test_causal_targets_are_offset_from_extraction_group_start(monkeypatch
         ]
         return facts, [(text, len(facts))], TokenUsage()
 
-    monkeypatch.setattr(fact_extraction, "extract_facts_from_text", extract_facts_from_text)
-    monkeypatch.setattr(fact_extraction, "_add_temporal_offsets", lambda *_args: None)
-    monkeypatch.setattr(fact_extraction, "_inject_label_tags", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_pipeline, "extract_facts_from_text", extract_facts_from_text)
+    monkeypatch.setattr(fact_extraction_pipeline, "_add_temporal_offsets", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_pipeline, "_inject_label_tags", lambda *_args: None)
 
     config = dataclasses.replace(_get_raw_config(), retain_extraction_mode="normal", retain_batch_enabled=False)
     facts, _, _ = await fact_extraction.extract_facts_from_contents(
@@ -62,9 +64,9 @@ async def test_each_chunk_uses_its_own_causal_index_base(monkeypatch):
         ]
         return facts, [("first", 2), ("second", 2)], TokenUsage()
 
-    monkeypatch.setattr(fact_extraction, "extract_facts_from_text", extract_facts_from_text)
-    monkeypatch.setattr(fact_extraction, "_add_temporal_offsets", lambda *_args: None)
-    monkeypatch.setattr(fact_extraction, "_inject_label_tags", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_pipeline, "extract_facts_from_text", extract_facts_from_text)
+    monkeypatch.setattr(fact_extraction_pipeline, "_add_temporal_offsets", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_pipeline, "_inject_label_tags", lambda *_args: None)
 
     config = dataclasses.replace(_get_raw_config(), retain_extraction_mode="normal", retain_batch_enabled=False)
     facts, _, _ = await fact_extraction.extract_facts_from_contents(
@@ -141,13 +143,13 @@ async def test_batch_causal_targets_use_each_chunk_start(monkeypatch):
                 for index, facts in enumerate(fact_groups)
             ]
 
-    monkeypatch.setattr(fact_extraction, "chunk_text", lambda text, **_kwargs: text.split("|"))
-    monkeypatch.setattr(fact_extraction, "_build_extraction_prompt_and_schema", lambda _config: ("", object))
-    monkeypatch.setattr(fact_extraction, "_retain_mission_preamble", lambda _config: "")
-    monkeypatch.setattr(fact_extraction, "_build_user_message", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(fact_extraction, "_build_request_body", lambda *_args: {})
-    monkeypatch.setattr(fact_extraction, "_add_temporal_offsets", lambda *_args: None)
-    monkeypatch.setattr(fact_extraction, "_inject_label_tags", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_batch, "chunk_text", lambda text, **_kwargs: text.split("|"))
+    monkeypatch.setattr(fact_extraction_batch, "_build_extraction_prompt_and_schema", lambda _config: ("", object))
+    monkeypatch.setattr(fact_extraction_batch, "_retain_mission_preamble", lambda _config: "")
+    monkeypatch.setattr(fact_extraction_batch, "_build_user_message", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(fact_extraction_batch, "_build_request_body", lambda *_args: {})
+    monkeypatch.setattr(fact_extraction_batch, "_add_temporal_offsets", lambda *_args: None)
+    monkeypatch.setattr(fact_extraction_batch, "_inject_label_tags", lambda *_args: None)
 
     config = dataclasses.replace(
         _get_raw_config(),

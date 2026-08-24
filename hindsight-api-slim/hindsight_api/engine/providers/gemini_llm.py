@@ -1074,7 +1074,7 @@ class GeminiLLM(LLMInterface):
     # to/from Gemini's file-upload → ``batches.create`` → ``batches.get`` →
     # download flow — nothing downstream changes (same pattern as FireworksLLM).
     #
-    # Interface contract preserved (see fact_extraction.py result handling)::
+    # Interface contract preserved (see fact_extraction/batch.py result handling)::
     #     result["response"]["body"]["choices"][0]["message"]["content"]
 
     async def supports_batch_api(self) -> bool:

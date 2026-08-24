@@ -219,6 +219,7 @@ def _extraction_config() -> SimpleNamespace:
 async def _run_extraction(chunk_errors: dict[int, Exception]):
     """Extract from a 2-chunk text where the given chunk indices raise."""
     from hindsight_api.engine.retain import fact_extraction
+    from hindsight_api.engine.retain.fact_extraction import streaming
 
     async def fake_chunk_extract(*, chunk_index: int, **_kwargs):
         error = chunk_errors.get(chunk_index)
@@ -226,7 +227,7 @@ async def _run_extraction(chunk_errors: dict[int, Exception]):
             raise error
         return [], fact_extraction.TokenUsage()
 
-    with patch.object(fact_extraction, "_extract_facts_with_auto_split", side_effect=fake_chunk_extract):
+    with patch.object(streaming, "_extract_facts_with_auto_split", side_effect=fake_chunk_extract):
         return await fact_extraction.extract_facts_from_text(
             text="First sentence. " * 100 + "\n\n" + "Second sentence. " * 100,
             event_date=None,

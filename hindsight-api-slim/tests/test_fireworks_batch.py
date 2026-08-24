@@ -7,7 +7,7 @@ the OpenAI-compatible path) and overrides only the four batch members, mapping
 the Fireworks workflow back onto the OpenAI-batch interface contract that the
 retain orchestrator + ``fact_extraction`` consumer depend on.
 
-The interface contract that MUST be preserved (see fact_extraction.py:1843):
+The interface contract that MUST be preserved (see fact_extraction/batch.py):
     result["response"]["body"]["choices"][0]["message"]["content"]
 
 API shapes (endpoints, ``state`` enum, ``jobProgress`` counts, download

@@ -89,13 +89,14 @@ async def test_short_retry_after_429_uses_normal_retry_loop() -> None:
 @pytest.mark.asyncio
 async def test_extract_facts_from_text_preserves_provider_quota_reset(monkeypatch) -> None:
     from hindsight_api.engine.retain import fact_extraction
+    from hindsight_api.engine.retain.fact_extraction import streaming
 
     retry_at = (datetime.now(UTC) + timedelta(hours=2)).replace(microsecond=0)
 
     async def quota_limited_chunk(**_: object) -> None:
         raise ProviderRateLimitResetError(retry_at=retry_at, message="quota resets later")
 
-    monkeypatch.setattr(fact_extraction, "_extract_facts_with_auto_split", quota_limited_chunk)
+    monkeypatch.setattr(streaming, "_extract_facts_with_auto_split", quota_limited_chunk)
 
     with pytest.raises(ProviderRateLimitResetError) as exc_info:
         await fact_extraction.extract_facts_from_text(

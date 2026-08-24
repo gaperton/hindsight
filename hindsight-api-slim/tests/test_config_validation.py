@@ -448,7 +448,7 @@ def test_log_config_masks_read_database_url(monkeypatch, caplog):
     assert "postgresql://***:***@replica:5432/db" in log_output
 
 
-# Note: The BadRequestError wrapping is implemented in fact_extraction.py
+# Note: The BadRequestError wrapping is implemented in fact_extraction/streaming.py
 # but requires a complex integration test setup. The functionality is
 # straightforward: when a BadRequestError containing keywords like
 # "max_tokens", "max_completion_tokens", or "maximum context" is caught,
