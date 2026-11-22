@@ -62,6 +62,17 @@ def make_pruner(**over: float):
 # -- the gate itself -------------------------------------------------------------
 
 
+def test_a_zero_floor_is_kept_not_reset_to_its_default():
+    """recall_prune_min_noul_of_best = 0 turns the relative floor off; it must not silently
+    become the 0.4 default. A zero count stays invalid and falls back."""
+    base = {"recall_prune_base_url": "http://x", "recall_prune_model": "m"}
+    pruner = dp.DecisionPruner.from_config(
+        {**base, "recall_prune_min_noul": 0.51, "recall_prune_min_noul_of_best": 0, "recall_prune_max_ask": 0}, "k"
+    )
+    assert (pruner.min_noul, pruner.min_noul_of_best) == (0.51, 0.0)
+    assert pruner.max_ask == dp.MAX_ASK_DEFAULT
+
+
 def test_each_question_is_plain_text_carrying_its_memory(monkeypatch):
     """oMLX's d1 engine refuses an object in `instructions` (it reads one as media), so every
     keep-question must be a string that still carries the task and its memory."""

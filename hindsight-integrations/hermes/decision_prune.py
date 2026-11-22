@@ -101,12 +101,14 @@ class DecisionPruner:
                 f"recall pruning needs {CONFIG_PREFIX}base_url, {CONFIG_PREFIX}model and an API key"
             )
 
-        def _num(name: str, default: float) -> float:
+        def _num(name: str, default: float, *, zero_ok: bool = False) -> float:
             try:
                 value = float(cfg.get(f"{CONFIG_PREFIX}{name}", default))
             except (TypeError, ValueError):
                 return default
-            return value if value > 0 else default
+            # A zero floor is a real setting (min_noul_of_best = 0 turns the relative floor off);
+            # a zero count or time limit is not.
+            return value if value > 0 or (zero_ok and value == 0) else default
 
         return cls(
             base_url=base_url,
@@ -114,8 +116,8 @@ class DecisionPruner:
             model=model,
             timeout_s=_num("timeout_s", 0) or None,
             max_gate_ms=_num("max_gate_ms", 2200.0),
-            min_noul=_num("min_noul", PRUNE_BELOW),
-            min_noul_of_best=_num("min_noul_of_best", PRUNE_BELOW_BEST),
+            min_noul=_num("min_noul", PRUNE_BELOW, zero_ok=True),
+            min_noul_of_best=_num("min_noul_of_best", PRUNE_BELOW_BEST, zero_ok=True),
             max_ask=int(_num("max_ask", MAX_ASK_DEFAULT)),
             min_results=int(_num("min_results", 3)),
         )
