@@ -128,6 +128,30 @@ class RecallJournal:
                 self._conn.commit()
         return kept, len(items) - len(kept)
 
+    def unrecord(self, session_id: str, results: Iterable[Any], message_no: int) -> int:
+        """Undo the recording of items that were recalled but never shown (prune drops).
+
+        Only rows stamped with *message_no* are deleted: an item shown on an earlier turn
+        keeps its mark and stays suppressed. Without this, a memory the relevance gate
+        dropped once would be journal-suppressed for the whole session — the gate's
+        verdict is per-turn (the next turn's query may make it grade as keep): never burn
+        what was not shown.
+        """
+        rows = []
+        for item in results:
+            uid = getattr(item, "id", None)
+            if uid:
+                rows.append((session_id, str(uid), content_hash(getattr(item, "text", None)), int(message_no)))
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM recall_journal WHERE session_id = ? AND uid = ? AND content_hash = ? AND message_no = ?",
+                rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
     def record(self, session_id: str, results: Iterable[Any], message_no: int) -> None:
         """Record items as shown without filtering (the ``hindsight_recall`` tool path:
         what the model pulled is in the transcript, so auto-recall must not re-show it,

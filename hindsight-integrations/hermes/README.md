@@ -270,6 +270,13 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_cron` | `false` | Also auto-recall in scheduled (cron) runs. Off by default: Hermes starts every cron prompt with a fixed notice longer than `recall_max_input_chars`, so the recall would search for that notice instead of the job and inject unrelated memories. The `hindsight_recall` and `hindsight_reflect` tools still work in cron runs. |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_session_dedup` | `true` | Within one session, never inject the same recalled item twice. Each injected item (id + content hash) is journaled in `$HERMES_HOME/hindsight/recall_journal.sqlite3` with the session message position and UTC time it was shown at; a re-consolidated observation (same id, new text) counts as new and shows again. Scope is per session; a brand-new fact is unaffected and journal errors never suppress a recall. |
+| `recall_prune` | `false` | Opt-in post-recall relevance gate, the LAST filter before the block renders (after the daemon's 4k-token cut and session dedup). It is the plugin's own pruner, separate from the Hindsight server's recall prune: it calls its own System One endpoint (`<recall_prune_base_url>/v1/systemone`, e.g. a local oMLX model) with its own `recall_prune_model`, which may differ from the server's decision model. It sends the surviving items as one `noul` keep-question each and drops items scoring below `max(recall_prune_min_noul, recall_prune_min_noul_of_best × best)` — filtering only, the daemon's ranking is never reordered and dropped slots are never backfilled (the block shrinks). The floor is absolute: when nothing clears it, the block empties and the turn runs without memories. Dropped items are un-journaled for the turn (never shown ≠ shown), so abstention doesn't burn anything. Fails open everywhere: unreachable gate, wall-clock cap exceeded, or bad config all ship the block unpruned. |
+| `recall_prune_base_url` | `""` | Required for `recall_prune`: the System One server's base URL. |
+| `recall_prune_model` | `""` | Required for `recall_prune`: the decision model to ask. |
+| `recall_prune_api_key` | — | Required for `recall_prune`: stored as `HINDSIGHT_RECALL_PRUNE_API_KEY` in the profile's `.env` (setup and the desktop panel put it there). |
+| `recall_prune_min_noul` / `recall_prune_min_noul_of_best` | `0.2` / `0.4` | The absolute floor and the share of the best score an item must reach. |
+| `recall_prune_max_gate_ms` / `recall_prune_timeout_s` | `2200` / cap + 1 s | Wall-clock cap on the whole grading step (urlopen timeouts don't bound a stall behind GPU work), and the socket timeout. |
+| `recall_prune_max_ask` / `recall_prune_min_results` | `80` / `3` | Most items graded per recall; fewer surviving items than `min_results` skips the gate. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
@@ -399,6 +406,8 @@ These are used **only when there is no config file at all**. Once `hermes memory
 | `HINDSIGHT_RECALL_INDICATOR` | `false` hides the "recalled N memories" status line (`recall_indicator`) |
 | `HINDSIGHT_RECALL_SYNC` | `true` recalls against the current message before answering (`recall_sync`) |
 | `HINDSIGHT_RECALL_SESSION_DEDUP` | `false` disables session-scoped recall dedup (`recall_session_dedup`) |
+| `HINDSIGHT_RECALL_PRUNE` | force the post-recall gate on/off, overriding `recall_prune` |
+| `HINDSIGHT_RECALL_PRUNE_API_KEY` | the post-recall gate's API key (`recall_prune_api_key`) |
 
 ## Client Version
 

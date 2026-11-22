@@ -52,6 +52,7 @@ from .embedded import (
     _start_daemon,
     _stop_daemon,
 )
+from .decision_prune import DecisionPruner
 from .session_journal import RecallJournal
 from .settings import (
     _DEFAULT_API_URL,
@@ -846,6 +847,27 @@ class HindsightMemoryProvider(MemoryProvider):
                 "key": "recall_min_scores",
                 "description": 'Minimum relevance per score field, as a JSON object (e.g. {"reranker": 0.25}). Recall always returns up to recall_max_tokens of the best-ranked memories even when none is relevant; memories under a floor are dropped from auto-recall and the hindsight_recall tool, so an off-topic turn injects nothing. Default: no floor',
                 "default": "",
+            },
+            {
+                "key": "recall_prune",
+                "description": "Recall pruning: after recall, ask a separate decision model which memories help answer the turn and drop the rest. Off by default; needs the three settings below.",
+                "default": False,
+            },
+            {
+                "key": "recall_prune_base_url",
+                "description": "Recall pruning endpoint (a System One server; the plugin calls <url>/v1/systemone)",
+                "default": "",
+            },
+            {
+                "key": "recall_prune_model",
+                "description": "Recall pruning model, independent of the Hindsight server's own decision model",
+                "default": "",
+            },
+            {
+                "key": "recall_prune_api_key",
+                "description": "Recall pruning endpoint API key",
+                "secret": True,
+                "env_var": "HINDSIGHT_RECALL_PRUNE_API_KEY",
             },
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {
@@ -1647,6 +1669,19 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
         self._recall_min_scores = _normalize_min_scores(cfg.get("recall_min_scores"))
+        # Post-recall relevance gate (see decision_prune.py): an opt-in System One pass that
+        # drops items judged no help for the query — filtering only, the daemon's ranking
+        # passes through untouched. Fails open everywhere: an unusable or unreachable gate
+        # costs verdicts, never memories.
+        # Its own model and endpoint (recall_prune_*), independent of the server's decision model.
+        self._pruner = None
+        # HINDSIGHT_RECALL_PRUNE=true/false overrides the config switch without an edit.
+        if _scoped_flag("HINDSIGHT_RECALL_PRUNE", default=bool(cfg.get("recall_prune", False))):
+            prune_key = cfg.get("recall_prune_api_key") or get_secret("HINDSIGHT_RECALL_PRUNE_API_KEY", "")
+            try:
+                self._pruner = DecisionPruner.from_config(cfg, prune_key)
+            except ValueError as exc:
+                logger.warning("recall_prune enabled but unusable (%s); gate disabled", exc)
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -1844,16 +1879,27 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
             results = self._recall(query)
+            msg_no = self._turn_counter + 1 if message_no is None else message_no
             if self._journal is not None:
                 try:
-                    results, suppressed = self._journal.filter_and_record(
-                        self._session_id, results,
-                        self._turn_counter + 1 if message_no is None else message_no,
-                    )
+                    results, suppressed = self._journal.filter_and_record(self._session_id, results, msg_no)
                     if suppressed:
                         logger.debug("Recall session-dedup: suppressed %d already-shown result(s)", suppressed)
                 except Exception as exc:  # fail OPEN
                     logger.warning("Recall session-dedup skipped this turn (journal error): %s", exc)
+            # Relevance gate, last filter before the block is rendered: drop what the
+            # decision model judges no help. No backfill — the block shrinks by exactly
+            # what was dropped. A dropped item is un-journaled (its row is this turn's):
+            # it was never shown, and the next turn's query may grade it keep again.
+            if self._pruner is not None and results:
+                try:
+                    results, dropped = self._pruner.prune(
+                        query, results, current_date=_hermes_now().date().isoformat()
+                    )
+                    if dropped and self._journal is not None:
+                        self._journal.unrecord(self._session_id, dropped, msg_no)
+                except Exception as exc:  # fail OPEN — the gate never costs memories
+                    logger.warning("recall prune skipped this turn: %s", exc)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
