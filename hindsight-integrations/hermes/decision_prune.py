@@ -44,6 +44,17 @@ MAX_STATE_CHARS = 8_000  # query cap inside the state (the daemon caps at 2k tok
 CONFIG_PREFIX = "recall_prune_"
 
 
+def keep_question(memory: str) -> str:
+    """One keep-question's instructions, as plain text.
+
+    Text, not a ``{task, memory}`` object: the System One spec allows both, but oMLX's d1
+    engine reads an object there as a media item and refuses the request, while every engine
+    reads text. Measured on real recalls, text also graded no worse on d3 and better on a d3
+    fine-tune (Stealth Sheep 2B: AUC 0.81 -> 0.86).
+    """
+    return f"{KEEP_INSTRUCTIONS}\n\nMemory: {memory}"
+
+
 class DecisionPruner:
     """Asks System One keep-questions over a recall block and drops the losers."""
 
@@ -117,7 +128,7 @@ class DecisionPruner:
             "model": self.model,
             "state": state,
             "questions": {
-                key: {"type": "noul", "instructions": {"task": KEEP_INSTRUCTIONS, "memory": memory}}
+                key: {"type": "noul", "instructions": keep_question(memory)}
                 for key, memory in questions.items()
             },
         }

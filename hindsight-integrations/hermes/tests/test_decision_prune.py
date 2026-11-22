@@ -62,6 +62,20 @@ def make_pruner(**over: float):
 # -- the gate itself -------------------------------------------------------------
 
 
+def test_each_question_is_plain_text_carrying_its_memory(monkeypatch):
+    """oMLX's d1 engine refuses an object in `instructions` (it reads one as media), so every
+    keep-question must be a string that still carries the task and its memory."""
+    urlopen = responder([0.9, 0.9, 0.9])
+    monkeypatch.setattr(dp.urllib.request, "urlopen", urlopen)
+    results = make_results(3)
+    make_pruner().prune("q?", results)
+    questions = urlopen.calls[0]["questions"]
+    for i, result in enumerate(results):
+        instructions = questions[f"m{i}"]["instructions"]
+        assert isinstance(instructions, str)
+        assert dp.KEEP_INSTRUCTIONS in instructions and result.text in instructions
+
+
 def test_relative_floor_drops_only_below_share_of_best(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.9, 0.5, 0.4, 0.05]))
     # floor = max(0.2, 0.4*0.9) = 0.36 → only m3 drops.
