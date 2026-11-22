@@ -23,8 +23,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,22 @@ MAX_MEMORY_CHARS = 16_000  # per-memory cap (≈4k tokens, the daemon's MAX_MEMO
 MAX_STATE_CHARS = 8_000  # query cap inside the state (the daemon caps at 2k tokens)
 #: Every setting of this gate is a flat plugin-config key under this prefix.
 CONFIG_PREFIX = "recall_prune_"
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """One gate pass. ``kept`` + ``dropped`` partition the input, in recall order.
+
+    ``graded`` is True only when verdicts were applied. ``skipped`` names why a gate that should
+    have run shipped the block unpruned (``None`` when it graded, or when too few items made
+    grading pointless); ``elapsed_ms`` is the whole step, wall clock.
+    """
+
+    kept: list
+    dropped: list
+    graded: bool
+    skipped: str | None
+    elapsed_ms: float
 
 
 def keep_question(memory: str) -> str:
@@ -174,16 +192,22 @@ class DecisionPruner:
 
     # -- the gate ----------------------------------------------------------------
 
-    def prune(self, query: str, results: Sequence[Any], *, current_date: str | None = None) -> tuple[list, list]:
-        """Split ``results`` (recall-ranked) into ``(kept, dropped)``.
+    def prune(self, query: str, results: Sequence[Any], *, current_date: str | None = None) -> PruneResult:
+        """Split ``results`` (recall-ranked) into kept and dropped.
 
-        Fails open: any error returns ``(list(results), [])``. The first ``max_ask`` items
-        are graded; items beyond it stay (they are the rarest of the rare tail of a cut that
-        is already capped). A result without ``.text`` is never asked and never dropped.
+        Fails open: any error keeps every item and says why in ``skipped``. The first
+        ``max_ask`` items are graded; items beyond it stay (they are the rarest of the rare
+        tail of a cut that is already capped). A result without ``.text`` is never asked and
+        never dropped.
         """
+        started = time.perf_counter()
+
+        def unpruned(reason: str | None) -> PruneResult:
+            return PruneResult(list(results), [], False, reason, (time.perf_counter() - started) * 1000)
+
         asked = [r for r in results if getattr(r, "text", None)][: self.max_ask]
         if len(asked) < self.min_results:
-            return list(results), []
+            return unpruned(None)
         state = f"Current date: {current_date}\n\nQuestion: " if current_date else "Question: "
         state += (query or "")[:MAX_STATE_CHARS]
         questions = {f"m{index}": r.text[:MAX_MEMORY_CHARS] for index, r in enumerate(asked)}
@@ -203,15 +227,15 @@ class DecisionPruner:
                 "decision prune skipped this turn (gate exceeded %.0f ms; block ships unpruned)",
                 self.max_gate_ms,
             )
-            return list(results), []
+            return unpruned(f"over {self.max_gate_ms:.0f} ms")
         if "answers" not in box:
             logger.warning("decision prune skipped this turn (%s)", box.get("error"))
-            return list(results), []
+            return unpruned(f"error: {type(box.get('error')).__name__}")
         answers: dict[str, float] = box.get("answers") or {}  # type: ignore[assignment]
         nouls = [answers.get(f"m{index}") for index in range(len(asked))]
         graded = [n for n in nouls if n is not None]
         if not graded:
-            return list(results), []
+            return unpruned("no verdicts")
         floor = max(self.min_noul, self.min_noul_of_best * max(graded))
         kept: list = []
         dropped: list = []
@@ -223,4 +247,4 @@ class DecisionPruner:
                 dropped.append(result)
         if dropped:
             logger.debug("decision prune: kept %d, dropped %d (floor %.3f)", len(kept), len(dropped), floor)
-        return kept, dropped
+        return PruneResult(kept, dropped, True, None, (time.perf_counter() - started) * 1000)

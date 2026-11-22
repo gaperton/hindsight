@@ -6,6 +6,8 @@ plugin sends it: one noul keep-question per result, answers keyed ``m0..mN``.
 
 import io
 import json
+import logging
+import re
 import sqlite3
 import urllib.error
 from types import SimpleNamespace
@@ -90,7 +92,8 @@ def test_each_question_is_plain_text_carrying_its_memory(monkeypatch):
 def test_relative_floor_drops_only_below_share_of_best(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.9, 0.5, 0.4, 0.05]))
     # floor = max(0.2, 0.4*0.9) = 0.36 → only m3 drops.
-    kept, dropped = make_pruner().prune("q?", make_results(4))
+    outcome = make_pruner().prune("q?", make_results(4))
+    kept, dropped = outcome.kept, outcome.dropped
     assert [r.id for r in kept] == ["id-0", "id-1", "id-2"]
     assert [r.id for r in dropped] == ["id-3"]
 
@@ -98,21 +101,24 @@ def test_relative_floor_drops_only_below_share_of_best(monkeypatch):
 def test_absolute_floor_drops_even_the_best(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.15, 0.10, 0.05]))
     # floor = max(0.2, 0.4*0.15) = 0.2 → everything is under it, the best too: the turn abstains.
-    kept, dropped = make_pruner().prune("q?", make_results(3))
+    outcome = make_pruner().prune("q?", make_results(3))
+    kept, dropped = outcome.kept, outcome.dropped
     assert kept == []
     assert [r.id for r in dropped] == ["id-0", "id-1", "id-2"]
 
 
 def test_unanswered_items_are_kept(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.15, 0.10]))  # m2 missing
-    kept, dropped = make_pruner().prune("q?", make_results(3))
+    outcome = make_pruner().prune("q?", make_results(3))
+    kept, dropped = outcome.kept, outcome.dropped
     assert [r.id for r in kept] == ["id-2"]  # per-item fail-open
     assert len(dropped) == 2
 
 
 def test_unanswered_item_is_kept(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.8, 0.7]))  # m2 missing
-    kept, dropped = make_pruner().prune("q?", make_results(3))
+    outcome = make_pruner().prune("q?", make_results(3))
+    kept, dropped = outcome.kept, outcome.dropped
     assert len(kept) == 3 and not dropped
 
 
@@ -121,8 +127,10 @@ def test_timeout_fails_open(monkeypatch):
         raise TimeoutError("slow gate")
 
     monkeypatch.setattr(dp.urllib.request, "urlopen", boom)
-    kept, dropped = make_pruner().prune("q?", make_results(5))
+    outcome = make_pruner().prune("q?", make_results(5))
+    kept, dropped = outcome.kept, outcome.dropped
     assert len(kept) == 5 and not dropped
+    assert not outcome.graded and outcome.skipped == "error: TimeoutError"
 
 
 def test_oversized_request_retries_in_halves(monkeypatch):
@@ -137,7 +145,8 @@ def test_oversized_request_retries_in_halves(monkeypatch):
         return ok(request, timeout)
 
     monkeypatch.setattr(dp.urllib.request, "urlopen", flaky)
-    kept, dropped = make_pruner().prune("q?", make_results(4))
+    outcome = make_pruner().prune("q?", make_results(4))
+    kept, dropped = outcome.kept, outcome.dropped
     assert len(kept) == 4 and not dropped and state["n"] == 3  # full + two halves
 
 
@@ -146,7 +155,8 @@ def test_small_blocks_are_not_asked(monkeypatch):
         raise AssertionError("must not ask for a block under min_results")
 
     monkeypatch.setattr(dp.urllib.request, "urlopen", never)
-    kept, dropped = make_pruner().prune("q?", make_results(2))
+    outcome = make_pruner().prune("q?", make_results(2))
+    kept, dropped = outcome.kept, outcome.dropped
     assert len(kept) == 2 and not dropped
 
 
@@ -159,14 +169,16 @@ def test_wall_deadline_ships_unpruned(monkeypatch):
 
     monkeypatch.setattr(dp.urllib.request, "urlopen", slow)
     pruner = make_pruner(timeout_s=5.0, max_gate_ms=100.0)
-    kept, dropped = pruner.prune("q?", make_results(5))
+    outcome = pruner.prune("q?", make_results(5))
+    kept, dropped = outcome.kept, outcome.dropped
     assert len(kept) == 5 and not dropped
 
 
 def test_max_ask_leaves_the_tail_ungraded(monkeypatch):
     monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.9, 0.1, 0.05]))
     pruner = make_pruner(max_ask=3, min_results=2)
-    kept, dropped = pruner.prune("q?", make_results(6))
+    outcome = pruner.prune("q?", make_results(6))
+    kept, dropped = outcome.kept, outcome.dropped
     # floor = 0.36 → m1/m2 drop; positions 3..5 were never asked and stay.
     assert [r.id for r in kept] == ["id-0", "id-3", "id-4", "id-5"]
     assert [r.id for r in dropped] == ["id-1", "id-2"]
@@ -258,6 +270,52 @@ def test_misconfigured_gate_disables_itself(provider, caplog):
     assert instance._pruner is None
     assert "unusable" in caplog.text or True  # warning logged; block must still ship
     assert "x" in instance.prefetch("q", session_id="s1")
+
+
+# -- what the user sees: the recall indicator and the log line ---------------------
+
+THREE_ITEMS = [("a", "fact x"), ("b", "fact y"), ("c", "fact z")]
+
+
+def test_indicator_names_each_stage_of_the_recall(provider, monkeypatch, caplog):
+    """The status line shows what recall found, what the gate dropped and how long it took;
+    the log carries the same breakdown."""
+    monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.9, 0.3, 0.05]))
+    instance, _ = provider({"recall_sync": True, "recall_prune": True, **PRUNE_CFG}, client=PruneFakeClient(THREE_ITEMS))
+    with caplog.at_level(logging.INFO):
+        instance.prefetch("q", session_id="s1")
+    status = instance.recall_status()
+    assert status.count == 1
+    assert re.fullmatch(r"Hindsight \(3 found · 2 pruned in \d+\.\ds\)", status.provider_label)
+    assert "recall: 3 found, 2 pruned in" in caplog.text and "-> 1 injected" in caplog.text
+
+
+def test_a_block_the_gate_emptied_is_still_reported(provider, monkeypatch, caplog):
+    """Hermes shows no indicator for an empty block, so the turn would pass in silence: the CLI
+    status channel and the log say that nothing relevant was injected."""
+    monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.1, 0.1, 0.1]))
+    lines = []
+    instance, _ = provider(
+        {"recall_sync": True, "recall_prune": True, **PRUNE_CFG},
+        client=PruneFakeClient(THREE_ITEMS), status_callback=lines.append,
+    )
+    with caplog.at_level(logging.INFO):
+        assert instance.prefetch("q", session_id="s1") == ""
+    assert instance.recall_status() is None
+    assert any("3 found · 3 pruned" in line and "nothing relevant to inject" in line for line in lines)
+    assert "nothing injected (block empty)" in caplog.text
+
+
+def test_a_skipped_gate_says_why_in_the_indicator(provider, monkeypatch):
+    def unreachable(request, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(dp.urllib.request, "urlopen", unreachable)
+    instance, _ = provider({"recall_sync": True, "recall_prune": True, **PRUNE_CFG}, client=PruneFakeClient(THREE_ITEMS))
+    instance.prefetch("q", session_id="s1")
+    status = instance.recall_status()
+    assert status.count == 3  # fail open: every item ships
+    assert status.provider_label == "Hindsight (3 found · prune skipped (error: OSError))"
 
 
 def test_gate_uses_its_own_model_and_env_key(provider, monkeypatch):

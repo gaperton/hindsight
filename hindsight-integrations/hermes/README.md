@@ -277,7 +277,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_prune_min_noul` / `recall_prune_min_noul_of_best` | `0.2` / `0.4` | The absolute floor and the share of the best score an item must reach. |
 | `recall_prune_max_gate_ms` / `recall_prune_timeout_s` | `2200` / cap + 1 s | Wall-clock cap on the whole grading step (urlopen timeouts don't bound a stall behind GPU work), and the socket timeout. |
 | `recall_prune_max_ask` / `recall_prune_min_results` | `80` / `3` | Most items graded per recall; fewer surviving items than `min_results` skips the gate. |
-| `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+| `recall_indicator` | `true` | Show a status line when auto-recall injects memory, with what each stage did: `👁️ Hindsight (76 found · 20 already shown · 31 pruned in 0.6s) — recalled 25 memories` (a stage that did nothing is left out; a gate that could not run says why, e.g. `prune skipped (over 2200 ms)`). The line is a status message: it never enters the chat history or the model's context. Hermes shows it only when something was injected, so when `recall_prune` empties the block the CLI gets `… — nothing relevant to inject` instead. Every recall also logs the same breakdown at INFO (`Hindsight recall: … -> N injected`, see `hermes logs`). Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >

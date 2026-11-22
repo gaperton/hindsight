@@ -53,6 +53,7 @@ from .embedded import (
     _stop_daemon,
 )
 from .decision_prune import DecisionPruner
+from .recall_report import RecallReport
 from .session_journal import RecallJournal
 from .settings import (
     _DEFAULT_API_URL,
@@ -598,8 +599,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._append_unsupported = False
         self._apply_retain_policy({})
 
-        # Recall: pending prefetch block + count, and the indicator state (recall_status()).
-        self._prefetch_result, self._prefetch_count = "", 0
+        # Recall: pending prefetch block + its report, and the indicator state (recall_status()).
+        self._prefetch_result, self._prefetch_report = "", None
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Bumped by every new prefetch, session switch and shutdown: a worker writes its result
@@ -607,6 +608,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # land in the next session.
         self._prefetch_generation = 0
         self._last_recall_returned, self._last_recall_count = False, 0
+        self._last_recall_report: RecallReport | None = None
         # Session-scoped recall dedup: flag set by _apply_recall_settings, journal opened in initialize().
         self._session_dedup = True
         self._journal = None
@@ -1864,27 +1866,26 @@ class HindsightMemoryProvider(MemoryProvider):
             raise
         return resp.text
 
-    def _do_recall(self, query: str, *, message_no: int | None = None) -> tuple[str, int]:
+    def _do_recall(self, query: str, *, message_no: int | None = None) -> tuple[str, RecallReport | None]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
-        -> (text, memory count); the count is 0 for reflect (synthesis) and on error, where the text
-        is ``_RECALL_FAILED_NOTE``. ``message_no`` is the session position the block will attach
-        to (journal)."""
+        -> (text, what each stage did); the report is None on error, where the text is
+        ``_RECALL_FAILED_NOTE``, and counts nothing for a reflect (a synthesis has no items).
+        ``message_no`` is the session position the block will attach to (journal)."""
         if self._recall_max_input_chars:
             query = query[: self._recall_max_input_chars]
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                return self._reflect(query) or "", 0
+                return self._reflect(query) or "", RecallReport(found=0, injected=0)
             logger.debug(
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
             results = self._recall(query)
+            found, already_shown, pruned, prune_ms, prune_skipped = len(results), None, None, None, None
             msg_no = self._turn_counter + 1 if message_no is None else message_no
             if self._journal is not None:
                 try:
-                    results, suppressed = self._journal.filter_and_record(self._session_id, results, msg_no)
-                    if suppressed:
-                        logger.debug("Recall session-dedup: suppressed %d already-shown result(s)", suppressed)
+                    results, already_shown = self._journal.filter_and_record(self._session_id, results, msg_no)
                 except Exception as exc:  # fail OPEN
                     logger.warning("Recall session-dedup skipped this turn (journal error): %s", exc)
             # Relevance gate, last filter before the block is rendered: drop what the
@@ -1893,26 +1894,38 @@ class HindsightMemoryProvider(MemoryProvider):
             # it was never shown, and the next turn's query may grade it keep again.
             if self._pruner is not None and results:
                 try:
-                    results, dropped = self._pruner.prune(
-                        query, results, current_date=_hermes_now().date().isoformat()
-                    )
-                    if dropped and self._journal is not None:
-                        self._journal.unrecord(self._session_id, dropped, msg_no)
+                    outcome = self._pruner.prune(query, results, current_date=_hermes_now().date().isoformat())
+                    results, prune_skipped = outcome.kept, outcome.skipped
+                    if outcome.graded:
+                        pruned, prune_ms = len(outcome.dropped), outcome.elapsed_ms
+                    if outcome.dropped and self._journal is not None:
+                        self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
                 except Exception as exc:  # fail OPEN — the gate never costs memories
                     logger.warning("recall prune skipped this turn: %s", exc)
-            logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
+                    prune_skipped = f"error: {type(exc).__name__}"
+            report = RecallReport(
+                found=found, injected=len(results), already_shown=already_shown,
+                pruned=pruned, prune_ms=prune_ms, prune_skipped=prune_skipped,
+            )
+            logger.info("Hindsight %s", report.log_line())
+            return "\n".join(f"- {r.text}" for r in results if r.text), report
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
             return _RECALL_FAILED_NOTE, 0
 
-    def _finish_prefetch(self, result: str, count: int) -> str:
+    def _finish_prefetch(self, result: str, report: RecallReport | None) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
         if result == _RECALL_FAILED_NOTE:
-            self._last_recall_returned, self._last_recall_count = False, 0
+            self._last_recall_returned, self._last_recall_count, self._last_recall_report = False, 0, None
             return result
-        self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
+        injected = report.injected if (result and report is not None) else 0
+        self._last_recall_returned, self._last_recall_count = bool(result), injected
+        self._last_recall_report = report if result else None
         if not result:
+            # Hermes shows its recall indicator only when a block is injected, so a turn the
+            # gate emptied would pass in silence; the CLI's status channel can still say so.
+            if report is not None and report.empty_after_prune() and self._recall_indicator:
+                self._emit_status_line(f"{_HINDSIGHT_GLYPH} {report.indicator_label()} — nothing relevant to inject")
             logger.debug("Prefetch: no results available")
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
@@ -1935,19 +1948,31 @@ class HindsightMemoryProvider(MemoryProvider):
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
         if self._recall_sync:
-            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query, message_no=self._turn_counter + 1)))
+            return self._finish_prefetch(*(("", None) if self._recall_disabled() else self._do_recall(query, message_no=self._turn_counter + 1)))
         # Default: the background worker's result for the previous turn (capped join).
         self._join_prefetch(3.0, log=True)
         with self._prefetch_lock:
-            result, count = self._prefetch_result, self._prefetch_count
-            self._prefetch_result, self._prefetch_count = "", 0
-        return self._finish_prefetch(result, count)
+            result, report = self._prefetch_result, self._prefetch_report
+            self._prefetch_result, self._prefetch_report = "", None
+        return self._finish_prefetch(result, report)
+
+    def _emit_status_line(self, line: str) -> None:
+        """A model-independent status line (CLI only: Hermes wires status_callback there)."""
+        if self._status_callback is None:
+            return
+        try:
+            self._status_callback(line)
+        except Exception:
+            logger.debug("Status line emit failed (non-fatal)", exc_info=True)
 
     def recall_status(self) -> Optional[RecallStatus]:
-        """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
+        """What the last prefetch injected, stage by stage in the label; None if nothing was
+        injected or ``recall_indicator=false``."""
         if not self._recall_indicator or not self._last_recall_returned:
             return None
-        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
+        report = self._last_recall_report
+        label = report.indicator_label() if report is not None else "Hindsight"
+        return RecallStatus(provider_label=label, count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
@@ -1969,11 +1994,12 @@ class HindsightMemoryProvider(MemoryProvider):
             # retain to be recall-visible so the warmed context includes it.
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query, message_no=message_no)
-            if text:
+            text, report = self._do_recall(query, message_no=message_no)
+            # An emptied block still carries its report, so the next turn can say why.
+            if text or report is not None:
                 with self._prefetch_lock:
                     if generation == self._prefetch_generation:
-                        self._prefetch_result, self._prefetch_count = text, count
+                        self._prefetch_result, self._prefetch_report = text, report
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2187,11 +2213,8 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         # Indicator fires only past every skip/buffer gate: solely on turns that persist.
         # Model-independent status line; no-op without retain_indicator/status channel.
-        if self._retain_indicator and self._status_callback is not None:
-            try:
-                self._status_callback(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
-            except Exception:
-                logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
+        if self._retain_indicator:
+            self._emit_status_line(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
         self._enqueue_retain(job)
         # Advance the watermark only after the delta is queued so a later retain
         # doesn't re-ship turns already handed to the writer.
