@@ -52,7 +52,7 @@ from .embedded import (
     _start_daemon,
     _stop_daemon,
 )
-from .decision_prune import DecisionPruner
+from .decision_prune import DecisionPruner, PruneResult
 from .recall_report import RecallReport
 from .session_journal import RecallJournal
 from .settings import (
@@ -524,6 +524,19 @@ _SYSTEM_PROMPT_TAILS = {
     "tools": _TOOL_GUIDANCE,
     "hybrid": f"{_CONTEXT_NOTE} {_TOOL_GUIDANCE}",
 }
+
+
+def _recall_report(found: int, kept: list, already_shown: int | None, outcome: PruneResult | None) -> RecallReport:
+    """What one recall's stages did, for the indicator and the log."""
+    graded = outcome is not None and outcome.graded
+    return RecallReport(
+        found=found,
+        injected=len(kept),
+        already_shown=already_shown,
+        pruned=len(outcome.dropped) if graded else None,
+        prune_ms=outcome.elapsed_ms if graded else None,
+        prune_skipped=outcome.skipped if outcome is not None else None,
+    )
 
 
 class HindsightMemoryProvider(MemoryProvider):
@@ -1881,7 +1894,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
             results = self._recall(query)
-            found, already_shown, pruned, prune_ms, prune_skipped = len(results), None, None, None, None
+            found, already_shown = len(results), None
             msg_no = self._turn_counter + 1 if message_no is None else message_no
             if self._journal is not None:
                 try:
@@ -1892,26 +1905,28 @@ class HindsightMemoryProvider(MemoryProvider):
             # decision model judges no help. No backfill — the block shrinks by exactly
             # what was dropped. A dropped item is un-journaled (its row is this turn's):
             # it was never shown, and the next turn's query may grade it keep again.
-            if self._pruner is not None and results:
-                try:
-                    outcome = self._pruner.prune(query, results, current_date=_hermes_now().date().isoformat())
-                    results, prune_skipped = outcome.kept, outcome.skipped
-                    if outcome.graded:
-                        pruned, prune_ms = len(outcome.dropped), outcome.elapsed_ms
-                    if outcome.dropped and self._journal is not None:
-                        self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
-                except Exception as exc:  # fail OPEN — the gate never costs memories
-                    logger.warning("recall prune skipped this turn: %s", exc)
-                    prune_skipped = f"error: {type(exc).__name__}"
-            report = RecallReport(
-                found=found, injected=len(results), already_shown=already_shown,
-                pruned=pruned, prune_ms=prune_ms, prune_skipped=prune_skipped,
-            )
+            outcome = self._gate(query, results)
+            if outcome is not None:
+                results = outcome.kept
+                if outcome.dropped and self._journal is not None:
+                    self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
+            report = _recall_report(found, results, already_shown, outcome)
             logger.info("Hindsight %s", report.log_line())
             return "\n".join(f"- {r.text}" for r in results if r.text), report
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
             return _RECALL_FAILED_NOTE, 0
+
+    def _gate(self, query: str, results: list) -> PruneResult | None:
+        """The relevance gate over *results* (None when it is off or there is nothing to grade).
+        Fails open: an exception keeps every item and says so in ``skipped``."""
+        if self._pruner is None or not results:
+            return None
+        try:
+            return self._pruner.prune(query, results, current_date=_hermes_now().date().isoformat())
+        except Exception as exc:  # the gate never costs memories
+            logger.warning("recall prune skipped: %s", exc)
+            return PruneResult(list(results), [], False, f"error: {type(exc).__name__}", 0.0)
 
     def _finish_prefetch(self, result: str, report: RecallReport | None) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
@@ -2295,12 +2310,19 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
         results = self._recall(query)
+        found = len(results)
+        # The relevance gate applies here too, graded against the model's own query: a tool
+        # answer stays in the transcript for the rest of the session, so its noise costs more
+        # than an automatic block's. Session dedup does NOT apply — the model asked explicitly.
+        outcome = self._gate(query, results)
+        if outcome is not None:
+            results = outcome.kept
         if self._journal is not None:
-            # Mark-only: the pulled facts are now in the transcript, so the next automatic
-            # block must not re-ship them; the tool answer itself is never filtered.
+            # Mark-only, and only what the model actually received: the next automatic block
+            # must not re-ship it; a pruned item was never shown and may surface later.
             with contextlib.suppress(Exception):
                 self._journal.record(self._session_id, results, self._turn_counter + 1)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
+        logger.info("Hindsight tool %s", _recall_report(found, results, None, outcome).log_line())
         return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
 
     def _tool_reflect(self, args: dict) -> str:

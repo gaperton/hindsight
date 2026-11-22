@@ -272,6 +272,29 @@ def test_misconfigured_gate_disables_itself(provider, caplog):
     assert "x" in instance.prefetch("q", session_id="s1")
 
 
+def test_tool_recall_is_pruned_against_the_models_own_query(provider, hermes_env, monkeypatch):
+    """A tool answer stays in the transcript, so the gate filters it too, graded against the
+    query the model wrote; only what the model received is marked shown."""
+    urlopen = responder([0.9, 0.05, 0.05])
+    monkeypatch.setattr(dp.urllib.request, "urlopen", urlopen)
+    items = [("a", "the answer the user wants"), ("b", "noise one"), ("c", "noise two")]
+    instance, _ = provider({"recall_prune": True, **PRUNE_CFG}, client=PruneFakeClient(items))
+    out = instance.handle_tool_call("hindsight_recall", {"query": "where is the offsite?"})
+    assert "the answer the user wants" in out and "noise one" not in out and "noise two" not in out
+    assert "where is the offsite?" in urlopen.calls[0]["state"]
+    assert [uid for uid, _ in _journal_rows(hermes_env)] == ["a"]  # pruned items were never shown
+
+
+def test_tool_recall_still_returns_what_was_already_shown(provider, monkeypatch):
+    """Session dedup does not apply to the tool: the model asked explicitly."""
+    monkeypatch.setattr(dp.urllib.request, "urlopen", responder([0.9, 0.9, 0.9]))
+    items = [("a", "fact one"), ("b", "fact two"), ("c", "fact three")]
+    instance, _ = provider({"recall_sync": True, "recall_prune": True, **PRUNE_CFG}, client=PruneFakeClient(items))
+    assert "fact one" in instance.prefetch("q1", session_id="s1")  # shown and journaled
+    out = instance.handle_tool_call("hindsight_recall", {"query": "q2"})
+    assert "fact one" in out and "fact two" in out and "fact three" in out
+
+
 # -- what the user sees: the recall indicator and the log line ---------------------
 
 THREE_ITEMS = [("a", "fact x"), ("b", "fact y"), ("c", "fact z")]

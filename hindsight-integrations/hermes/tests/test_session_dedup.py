@@ -98,7 +98,7 @@ def test_updated_observation_shows_again(sync_provider):
 def test_tool_recall_shows_all_and_marks_the_journal(sync_provider, hermes_env):
     p, _ = sync_provider([[("a", "fact A"), ("b", "fact B")]])
     out = p.handle_tool_call("hindsight_recall", {"query": "q"})
-    assert "fact A" in out and "fact B" in out  # tool answers are never filtered
+    assert "fact A" in out and "fact B" in out  # tool answers are never deduped
     assert [r[1] for r in _journal_rows(hermes_env)] == ["a", "b"]  # ...but are recorded
     # The next automatic block must not re-ship what the model already pulled.
     assert p.prefetch("q2") == ""
