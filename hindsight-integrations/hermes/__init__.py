@@ -52,6 +52,7 @@ from .embedded import (
     _start_daemon,
     _stop_daemon,
 )
+from .session_journal import RecallJournal
 from .settings import (
     _DEFAULT_API_URL,
     _DEFAULT_IDLE_TIMEOUT,
@@ -447,6 +448,7 @@ def _load_config() -> dict:
         "retain_indicator": _scoped_flag("HINDSIGHT_RETAIN_INDICATOR", True),
         "recall_indicator": _scoped_flag("HINDSIGHT_RECALL_INDICATOR", True),
         "recall_sync": _scoped_flag("HINDSIGHT_RECALL_SYNC", False),
+        "recall_session_dedup": _scoped_flag("HINDSIGHT_RECALL_SESSION_DEDUP", True),
         "banks": {
             "hermes": {
                 "bankId": get_secret("HINDSIGHT_BANK_ID", "") or "hermes",
@@ -531,7 +533,9 @@ class HindsightMemoryProvider(MemoryProvider):
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
         with contextlib.suppress(Exception):
-            return [str(Path.home() / ".hindsight")]
+            paths = [str(Path.home() / ".hindsight")]
+            paths.append(str(Path(get_hermes_home()) / "hindsight" / "recall_journal.sqlite3"))
+            return paths
         return []
 
     def __init__(self):
@@ -602,6 +606,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # land in the next session.
         self._prefetch_generation = 0
         self._last_recall_returned, self._last_recall_count = False, 0
+        # Session-scoped recall dedup: flag set by _apply_recall_settings, journal opened in initialize().
+        self._session_dedup = True
+        self._journal = None
         self._apply_recall_settings({})
 
     @property
@@ -1357,6 +1364,18 @@ class HindsightMemoryProvider(MemoryProvider):
         self._apply_connection_settings(cfg)
         self._apply_retain_settings(cfg)
         self._apply_recall_settings(cfg)
+        # Session-scoped recall dedup: open the journal; make the message counter durable across
+        # a restart of the same session (Hermes core exposes no message index to providers).
+        self._journal = None
+        if self._session_dedup and self._session_id:
+            try:
+                journal_path = Path(kwargs.get("hermes_home") or get_hermes_home()) / "hindsight" / "recall_journal.sqlite3"
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                self._journal = RecallJournal(journal_path)
+                self._turn_counter = max(self._turn_counter, self._journal.max_message_no(self._session_id))
+            except Exception as exc:  # fail OPEN: bookkeeping must never cost a recall
+                logger.warning("Recall session-dedup disabled (journal unavailable): %s", exc)
+                self._journal = None
 
         client_version = "unknown"
         with contextlib.suppress(Exception):
@@ -1613,6 +1632,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # ~4k tokens of unrelated memories (#6145). recall_cron opts back in; the tools still work.
         cron_skip = getattr(self, "_agent_context", "primary") == "cron" and not cfg.get("recall_cron", False)
         self._auto_recall = cfg.get("auto_recall", True) and not cron_skip
+        # Cross-turn dedup of automatic recall within one session (see session_journal.py).
+        self._session_dedup = bool(cfg.get("recall_session_dedup", True))
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = _parse_int_setting(cfg.get("recall_max_tokens"), 4096)
         self._recall_max_input_chars = _parse_int_setting(cfg.get("recall_max_input_chars"), 800)
@@ -1808,10 +1829,11 @@ class HindsightMemoryProvider(MemoryProvider):
             raise
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, *, message_no: int | None = None) -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, memory count); the count is 0 for reflect (synthesis) and on error, where the text
-        is ``_RECALL_FAILED_NOTE``."""
+        is ``_RECALL_FAILED_NOTE``. ``message_no`` is the session position the block will attach
+        to (journal)."""
         if self._recall_max_input_chars:
             query = query[: self._recall_max_input_chars]
         try:
@@ -1822,6 +1844,16 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
             results = self._recall(query)
+            if self._journal is not None:
+                try:
+                    results, suppressed = self._journal.filter_and_record(
+                        self._session_id, results,
+                        self._turn_counter + 1 if message_no is None else message_no,
+                    )
+                    if suppressed:
+                        logger.debug("Recall session-dedup: suppressed %d already-shown result(s)", suppressed)
+                except Exception as exc:  # fail OPEN
+                    logger.warning("Recall session-dedup skipped this turn (journal error): %s", exc)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
@@ -1857,7 +1889,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
         if self._recall_sync:
-            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
+            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query, message_no=self._turn_counter + 1)))
         # Default: the background worker's result for the previous turn (capped join).
         self._join_prefetch(3.0, log=True)
         with self._prefetch_lock:
@@ -1882,13 +1914,16 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             generation = self._prefetch_generation
+        # The block lands on the NEXT user message; capture the position now so a slow
+        # worker cannot stamp it with a newer turn's number.
+        message_no = self._turn_counter + 1
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
             # retain to be recall-visible so the warmed context includes it.
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query)
+            text, count = self._do_recall(query, message_no=message_no)
             if text:
                 with self._prefetch_lock:
                     if generation == self._prefetch_generation:
@@ -2191,6 +2226,11 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
         results = self._recall(query)
+        if self._journal is not None:
+            # Mark-only: the pulled facts are now in the transcript, so the next automatic
+            # block must not re-ship them; the tool answer itself is never filtered.
+            with contextlib.suppress(Exception):
+                self._journal.record(self._session_id, results, self._turn_counter + 1)
         logger.debug("Tool hindsight_recall: %d results", len(results))
         return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
 

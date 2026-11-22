@@ -269,6 +269,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_cron` | `false` | Also auto-recall in scheduled (cron) runs. Off by default: Hermes starts every cron prompt with a fixed notice longer than `recall_max_input_chars`, so the recall would search for that notice instead of the job and inject unrelated memories. The `hindsight_recall` and `hindsight_reflect` tools still work in cron runs. |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
+| `recall_session_dedup` | `true` | Within one session, never inject the same recalled item twice. Each injected item (id + content hash) is journaled in `$HERMES_HOME/hindsight/recall_journal.sqlite3` with the session message position and UTC time it was shown at; a re-consolidated observation (same id, new text) counts as new and shows again. Scope is per session; a brand-new fact is unaffected and journal errors never suppress a recall. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
@@ -397,6 +398,7 @@ These are used **only when there is no config file at all**. Once `hermes memory
 | `HINDSIGHT_RETAIN_INDICATOR` | `false` hides the "saving to memory" status line (`retain_indicator`) |
 | `HINDSIGHT_RECALL_INDICATOR` | `false` hides the "recalled N memories" status line (`recall_indicator`) |
 | `HINDSIGHT_RECALL_SYNC` | `true` recalls against the current message before answering (`recall_sync`) |
+| `HINDSIGHT_RECALL_SESSION_DEDUP` | `false` disables session-scoped recall dedup (`recall_session_dedup`) |
 
 ## Client Version
 
