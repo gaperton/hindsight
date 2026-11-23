@@ -89,22 +89,28 @@ class RecallJournal:
 
     def filter_and_record(
         self, session_id: str, results: Iterable[Any], message_no: int
-    ) -> tuple[list[Any], int]:
-        """Drop already-shown items, record what passes. -> ``(kept, suppressed)``.
+    ) -> tuple[list[Any], list[tuple[Any, str]]]:
+        """Drop already-shown items, record what passes. -> ``(kept, dropped)``.
+
+        ``dropped`` is ``[(item, reason)]`` for the audit trail: ``"already_shown"`` was
+        recorded on an earlier turn of this session, ``"repeat"`` is a within-response
+        duplicate that already shows once in this block.
 
         Items without an id are passed through unrecorded (nothing to key on).
         Order of *results* is preserved.
         """
         with self._lock:
-            seen = {
+            seen_earlier = {
                 (row[0], row[1])
                 for row in self._conn.execute(
                     "SELECT uid, content_hash FROM recall_journal WHERE session_id = ?",
                     (session_id,),
                 )
             }
+            seen = set(seen_earlier)
             items = list(results)
             kept: list[Any] = []
+            dropped: list[tuple[Any, str]] = []
             new_rows: list[tuple[str, str, str, int, str]] = []
             now = _utc_now()
             for item in items:
@@ -114,6 +120,7 @@ class RecallJournal:
                     continue
                 pair = (str(uid), content_hash(getattr(item, "text", None)))
                 if pair in seen:
+                    dropped.append((item, "already_shown" if pair in seen_earlier else "repeat"))
                     continue
                 seen.add(pair)  # a within-response repeat shows once, like the block would
                 kept.append(item)
@@ -126,7 +133,7 @@ class RecallJournal:
                     new_rows,
                 )
                 self._conn.commit()
-        return kept, len(items) - len(kept)
+        return kept, dropped
 
     def unrecord(self, session_id: str, results: Iterable[Any], message_no: int) -> int:
         """Undo the recording of items that were recalled but never shown (prune drops).

@@ -277,6 +277,8 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_prune_min_noul` / `recall_prune_min_noul_of_best` | `0.2` / `0.4` | The absolute floor and the share of the best score an item must reach. |
 | `recall_prune_max_gate_ms` / `recall_prune_timeout_s` | `2200` / cap + 1 s | Wall-clock cap on the whole grading step (urlopen timeouts don't bound a stall behind GPU work), and the socket timeout. |
 | `recall_prune_max_ask` / `recall_prune_min_results` | `80` / `3` | Most items graded per recall; fewer surviving items than `min_results` skips the gate. |
+| `recall_audit` | `true` | Per-request audit trail for automatic recall: one `recall_requests` row per recall in `$HERMES_HOME/hindsight/recall_journal.sqlite3` (same DB as session dedup) with the query, one count column per filtering phase (`n_found = n_duplicated + n_pruned + n_injected`; duplicated = session-dedup drops: already shown this session or a repeat within one response), the relevance gate's status (`off`/`graded`/`too-few`/`skipped:<why>` — without it `n_pruned=0` can't tell "all survived" from "never graded") and its floor, timing, and every returned item in `items_json` tagged with its fate — `injected`, `already_shown`/`repeat`, or `pruned` with the noul that sank it (the injected block is exactly the `injected` items joined as `- ` bullets, so it is not stored twice). Reflect and `hindsight_recall` tool calls are not audited (nothing is dropped there). Failed recalls get an `error` row. Audit write errors never cost a recall. |
+| `recall_audit_max_rows` | `1000` | How many audit rows to keep; the table is trimmed to the newest N on every write. Rows carry full item text (~15–20 KB for a full block), so this bounds the DB at a few tens of MB. |
 | `recall_indicator` | `true` | Show a status line when auto-recall injects memory, with what each stage did: `👁️ Hindsight (76 found · 20 already shown · 31 pruned in 0.6s) — recalled 25 memories` (a stage that did nothing is left out; a gate that could not run says why, e.g. `prune skipped (over 2200 ms)`). The line is a status message: it never enters the chat history or the model's context. Hermes shows it only when something was injected, so when `recall_prune` empties the block the CLI gets `… — nothing relevant to inject` instead. Every recall also logs the same breakdown at INFO (`Hindsight recall: … -> N injected`, see `hermes logs`). Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
@@ -406,6 +408,7 @@ These are used **only when there is no config file at all**. Once `hermes memory
 | `HINDSIGHT_RECALL_INDICATOR` | `false` hides the "recalled N memories" status line (`recall_indicator`) |
 | `HINDSIGHT_RECALL_SYNC` | `true` recalls against the current message before answering (`recall_sync`) |
 | `HINDSIGHT_RECALL_SESSION_DEDUP` | `false` disables session-scoped recall dedup (`recall_session_dedup`) |
+| `HINDSIGHT_RECALL_AUDIT` | `false` disables the per-request recall audit trail (`recall_audit`) |
 | `HINDSIGHT_RECALL_PRUNE` | force the post-recall gate on/off, overriding `recall_prune` |
 | `HINDSIGHT_RECALL_PRUNE_API_KEY` | the post-recall gate's API key (`recall_prune_api_key`) |
 

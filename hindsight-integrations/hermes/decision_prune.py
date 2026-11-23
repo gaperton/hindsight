@@ -60,6 +60,11 @@ class PruneResult:
     graded: bool
     skipped: str | None
     elapsed_ms: float
+    #: The noul of each dropped item, parallel to ``dropped`` — the audit trail records
+    #: why each item fell below ``floor``. Empty unless graded.
+    dropped_nouls: tuple = ()
+    #: The combined floor the drops failed against (None unless graded).
+    floor: float | None = None
 
 
 def keep_question(memory: str) -> str:
@@ -239,12 +244,16 @@ class DecisionPruner:
         floor = max(self.min_noul, self.min_noul_of_best * max(graded))
         kept: list = []
         dropped: list = []
+        dropped_nouls: list[float] = []
         for index, result in enumerate(results):
             noul = nouls[index] if index < len(nouls) else None
             if index >= len(asked) or noul is None or noul >= floor:
                 kept.append(result)
             else:
                 dropped.append(result)
+                dropped_nouls.append(noul)
         if dropped:
             logger.debug("decision prune: kept %d, dropped %d (floor %.3f)", len(kept), len(dropped), floor)
-        return PruneResult(kept, dropped, True, None, (time.perf_counter() - started) * 1000)
+        return PruneResult(
+            kept, dropped, True, None, (time.perf_counter() - started) * 1000, tuple(dropped_nouls), floor
+        )

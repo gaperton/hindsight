@@ -114,7 +114,7 @@ def test_injected_fact_never_repeated_by_tool_on_later_turn(sync_provider):
 
 def test_disabled_flag_creates_no_journal(hermes_env, provider):
     client = JournalFakeClient([[("a", "fact A")]])
-    p, _ = provider({"recall_sync": True, "recall_session_dedup": False}, client=client)
+    p, _ = provider({"recall_sync": True, "recall_session_dedup": False, "recall_audit": False}, client=client)
     assert p._journal is None
     assert "fact A" in p.prefetch("q1")
     assert "fact A" in p.prefetch("q2")  # no suppression without the journal

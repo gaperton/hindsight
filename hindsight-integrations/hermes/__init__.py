@@ -53,6 +53,7 @@ from .embedded import (
     _stop_daemon,
 )
 from .decision_prune import DecisionPruner, PruneResult
+from .recall_audit import RecallAudit
 from .recall_report import RecallReport
 from .session_journal import RecallJournal
 from .settings import (
@@ -451,6 +452,7 @@ def _load_config() -> dict:
         "recall_indicator": _scoped_flag("HINDSIGHT_RECALL_INDICATOR", True),
         "recall_sync": _scoped_flag("HINDSIGHT_RECALL_SYNC", False),
         "recall_session_dedup": _scoped_flag("HINDSIGHT_RECALL_SESSION_DEDUP", True),
+        "recall_audit": _scoped_flag("HINDSIGHT_RECALL_AUDIT", True),
         "banks": {
             "hermes": {
                 "bankId": get_secret("HINDSIGHT_BANK_ID", "") or "hermes",
@@ -625,6 +627,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # Session-scoped recall dedup: flag set by _apply_recall_settings, journal opened in initialize().
         self._session_dedup = True
         self._journal = None
+        # Per-request recall audit trail: same DB, opened alongside the journal in initialize().
+        self._audit_enabled, self._audit_max_rows, self._audit = True, 1000, None
         self._apply_recall_settings({})
 
     @property
@@ -1403,16 +1407,29 @@ class HindsightMemoryProvider(MemoryProvider):
         self._apply_recall_settings(cfg)
         # Session-scoped recall dedup: open the journal; make the message counter durable across
         # a restart of the same session (Hermes core exposes no message index to providers).
+        # The audit trail shares the journal DB but opens independently: either one works
+        # without the other, and neither failing blocks the other.
         self._journal = None
-        if self._session_dedup and self._session_id:
-            try:
+        self._audit = None
+        if self._session_id:
+            journal_path = None
+            with contextlib.suppress(Exception):
                 journal_path = Path(kwargs.get("hermes_home") or get_hermes_home()) / "hindsight" / "recall_journal.sqlite3"
                 journal_path.parent.mkdir(parents=True, exist_ok=True)
-                self._journal = RecallJournal(journal_path)
-                self._turn_counter = max(self._turn_counter, self._journal.max_message_no(self._session_id))
-            except Exception as exc:  # fail OPEN: bookkeeping must never cost a recall
-                logger.warning("Recall session-dedup disabled (journal unavailable): %s", exc)
-                self._journal = None
+            if journal_path is not None:
+                if self._session_dedup:
+                    try:
+                        self._journal = RecallJournal(journal_path)
+                        self._turn_counter = max(self._turn_counter, self._journal.max_message_no(self._session_id))
+                    except Exception as exc:  # fail OPEN: bookkeeping must never cost a recall
+                        logger.warning("Recall session-dedup disabled (journal unavailable): %s", exc)
+                        self._journal = None
+                if self._audit_enabled:
+                    try:
+                        self._audit = RecallAudit(journal_path, max_rows=self._audit_max_rows)
+                    except Exception as exc:  # fail OPEN: the audit trail never costs a recall
+                        logger.warning("Recall audit disabled (audit table unavailable): %s", exc)
+                        self._audit = None
 
         client_version = "unknown"
         with contextlib.suppress(Exception):
@@ -1671,6 +1688,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = cfg.get("auto_recall", True) and not cron_skip
         # Cross-turn dedup of automatic recall within one session (see session_journal.py).
         self._session_dedup = bool(cfg.get("recall_session_dedup", True))
+        # Per-request recall audit trail (see recall_audit.py): the query, the injected block
+        # and every returned item's fate, one row per recall in the journal DB. On by default;
+        # HINDSIGHT_RECALL_AUDIT=false is the kill switch (env rides in as the config default).
+        self._audit_enabled = bool(cfg.get("recall_audit", True))
+        self._audit_max_rows = _parse_int_setting(cfg.get("recall_audit_max_rows"), 1000)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = _parse_int_setting(cfg.get("recall_max_tokens"), 4096)
         self._recall_max_input_chars = _parse_int_setting(cfg.get("recall_max_input_chars"), 800)
@@ -1883,9 +1905,13 @@ class HindsightMemoryProvider(MemoryProvider):
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, what each stage did); the report is None on error, where the text is
         ``_RECALL_FAILED_NOTE``, and counts nothing for a reflect (a synthesis has no items).
-        ``message_no`` is the session position the block will attach to (journal)."""
+        ``message_no`` is the session position the block will attach to (journal).
+        Each call writes one audit row (see recall_audit.py); the reflect path is not
+        audited (synthesized prose, no items to tag)."""
         if self._recall_max_input_chars:
             query = query[: self._recall_max_input_chars]
+        msg_no = self._turn_counter + 1 if message_no is None else message_no
+        started = time.perf_counter()
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
@@ -1893,12 +1919,15 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug(
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
-            results = self._recall(query)
-            found, already_shown = len(results), None
-            msg_no = self._turn_counter + 1 if message_no is None else message_no
+            raw = self._recall(query)
+            found = len(raw)
+            results = raw
+            journal_dropped: list[tuple[object, str]] = []
+            already_shown = None
             if self._journal is not None:
                 try:
-                    results, already_shown = self._journal.filter_and_record(self._session_id, results, msg_no)
+                    results, journal_dropped = self._journal.filter_and_record(self._session_id, results, msg_no)
+                    already_shown = len(journal_dropped)
                 except Exception as exc:  # fail OPEN
                     logger.warning("Recall session-dedup skipped this turn (journal error): %s", exc)
             # Relevance gate, last filter before the block is rendered: drop what the
@@ -1912,10 +1941,56 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
             report = _recall_report(found, results, already_shown, outcome)
             logger.info("Hindsight %s", report.log_line())
+            self._audit_recall(query, msg_no, raw, journal_dropped, outcome, report, started)
             return "\n".join(f"- {r.text}" for r in results if r.text), report
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
+            self._audit_recall(query, msg_no, [], [], None, None, started, error=str(e))
             return _RECALL_FAILED_NOTE, 0
+
+    def _audit_recall(self, query, message_no, raw, journal_dropped, outcome, report, started, *, error=None) -> None:
+        """One audit row per request: the query, one count per phase
+        (``n_found = n_duplicated + n_pruned + n_injected``), and every returned item
+        tagged with its fate. Item identity is the live object — every list here holds
+        its refs, so ``id()`` is a stable key for the call. Fail OPEN: a broken write
+        costs the row, not the recall."""
+        if self._audit is None:
+            return
+        try:
+            fate: dict[int, tuple[str, float | None]] = {id(item): (reason, None) for item, reason in journal_dropped}
+            gate_status, n_pruned, floor = "off", 0, None
+            if outcome is not None:
+                gate_status = "graded" if outcome.graded else (f"skipped:{outcome.skipped}" if outcome.skipped else "too-few")
+                if outcome.graded:
+                    n_pruned, floor = len(outcome.dropped), outcome.floor
+                    nouls = outcome.dropped_nouls
+                    for index, item in enumerate(outcome.dropped):
+                        fate[id(item)] = ("pruned", nouls[index] if index < len(nouls) else None)
+            items = []
+            for r in raw:
+                stage, noul = fate.get(id(r), ("injected", None))
+                items.append({
+                    "uid": (str(r.id) if getattr(r, "id", None) else None),
+                    "text": r.text or "",
+                    "stage": stage,
+                    "noul": noul,
+                })
+            self._audit.record(
+                session_id=self._session_id,
+                message_no=message_no,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                query=query,
+                n_found=len(raw),
+                n_duplicated=len(journal_dropped),
+                n_pruned=n_pruned,
+                n_injected=report.injected if report is not None else 0,
+                gate_status=gate_status,
+                prune_floor=floor,
+                items=items,
+                error=error,
+            )
+        except Exception as exc:  # the audit trail is never worth a lost recall
+            logger.warning("recall audit skipped: %s", exc)
 
     def _gate(self, query: str, results: list) -> PruneResult | None:
         """The relevance gate over *results* (None when it is off or there is nothing to grade).
