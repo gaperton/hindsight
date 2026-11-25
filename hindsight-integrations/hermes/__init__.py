@@ -53,6 +53,7 @@ from .embedded import (
     _stop_daemon,
 )
 from .decision_prune import DecisionPruner, PruneResult
+from .recall_skip import CueGate
 from .recall_audit import RecallAudit
 from .recall_report import RecallReport
 from .session_journal import RecallJournal
@@ -888,6 +889,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 "secret": True,
                 "env_var": "HINDSIGHT_RECALL_PRUNE_API_KEY",
             },
+            {
+                "key": "recall_skip_no_cue",
+                "description": "Before recall, ask the recall pruning model whether the message names anything concrete to recall by, and skip the search when it does not (ok, go ahead, the second one). Off by default; uses the recall pruning endpoint, model and key.",
+                "default": False,
+            },
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {
                 "key": "recall_sync",
@@ -1719,6 +1725,16 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._pruner = DecisionPruner.from_config(cfg, prune_key)
             except ValueError as exc:
                 logger.warning("recall_prune enabled but unusable (%s); gate disabled", exc)
+        # Pre-recall cue gate (see recall_skip.py): an opt-in question before the search that skips
+        # the recall when the message names nothing to recall by. Shares the relevance gate's
+        # endpoint and key (whether or not pruning itself is on); fails open like it.
+        self._cue_gate = None
+        if cfg.get("recall_skip_no_cue", False):
+            gate_key = cfg.get("recall_prune_api_key") or get_secret("HINDSIGHT_RECALL_PRUNE_API_KEY", "")
+            try:
+                self._cue_gate = CueGate.from_config(cfg, gate_key)
+            except ValueError as exc:
+                logger.warning("recall_skip_no_cue enabled but unusable (%s); recalling every turn", exc)
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -1907,11 +1923,19 @@ class HindsightMemoryProvider(MemoryProvider):
         ``_RECALL_FAILED_NOTE``, and counts nothing for a reflect (a synthesis has no items).
         ``message_no`` is the session position the block will attach to (journal).
         Each call writes one audit row (see recall_audit.py); the reflect path is not
-        audited (synthesized prose, no items to tag)."""
+        audited (synthesized prose, no items to tag). The cue gate asks first, on the whole
+        message, and a message with no cue skips the search (audited as ``recall-skipped``)."""
+        started = time.perf_counter()
+        verdict = self._cue_gate.judge(query) if self._cue_gate is not None else None
+        cue_noul = verdict.noul if verdict is not None else None
         if self._recall_max_input_chars:
             query = query[: self._recall_max_input_chars]
         msg_no = self._turn_counter + 1 if message_no is None else message_no
-        started = time.perf_counter()
+        if verdict is not None and verdict.skip:
+            report = RecallReport(found=0, injected=0, skipped_no_cue=cue_noul)
+            logger.info("Hindsight %s", report.log_line())
+            self._audit_recall(query, msg_no, [], [], None, report, started, cue_noul=cue_noul)
+            return "", report
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
@@ -1941,14 +1965,16 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
             report = _recall_report(found, results, already_shown, outcome)
             logger.info("Hindsight %s", report.log_line())
-            self._audit_recall(query, msg_no, raw, journal_dropped, outcome, report, started)
+            self._audit_recall(query, msg_no, raw, journal_dropped, outcome, report, started, cue_noul=cue_noul)
             return "\n".join(f"- {r.text}" for r in results if r.text), report
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
-            self._audit_recall(query, msg_no, [], [], None, None, started, error=str(e))
+            self._audit_recall(query, msg_no, [], [], None, None, started, error=str(e), cue_noul=cue_noul)
             return _RECALL_FAILED_NOTE, 0
 
-    def _audit_recall(self, query, message_no, raw, journal_dropped, outcome, report, started, *, error=None) -> None:
+    def _audit_recall(
+        self, query, message_no, raw, journal_dropped, outcome, report, started, *, error=None, cue_noul=None
+    ) -> None:
         """One audit row per request: the query, one count per phase
         (``n_found = n_duplicated + n_pruned + n_injected``), and every returned item
         tagged with its fate. Item identity is the live object — every list here holds
@@ -1959,7 +1985,9 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             fate: dict[int, tuple[str, float | None]] = {id(item): (reason, None) for item, reason in journal_dropped}
             gate_status, n_pruned, floor = "off", 0, None
-            if outcome is not None:
+            if report is not None and report.skipped_no_cue is not None:
+                gate_status = "recall-skipped"
+            elif outcome is not None:
                 gate_status = "graded" if outcome.graded else (f"skipped:{outcome.skipped}" if outcome.skipped else "too-few")
                 if outcome.graded:
                     n_pruned, floor = len(outcome.dropped), outcome.floor
@@ -1988,6 +2016,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 prune_floor=floor,
                 items=items,
                 error=error,
+                cue_noul=cue_noul,
             )
         except Exception as exc:  # the audit trail is never worth a lost recall
             logger.warning("recall audit skipped: %s", exc)
@@ -2016,6 +2045,10 @@ class HindsightMemoryProvider(MemoryProvider):
             # gate emptied would pass in silence; the CLI's status channel can still say so.
             if report is not None and report.empty_after_prune() and self._recall_indicator:
                 self._emit_status_line(f"{_HINDSIGHT_GLYPH} {report.indicator_label()} — nothing relevant to inject")
+            elif report is not None and report.skipped_no_cue is not None and self._recall_indicator:
+                self._emit_status_line(
+                    f"{_HINDSIGHT_GLYPH} Hindsight — recall skipped, nothing to recall by (p={report.skipped_no_cue:.2f})"
+                )
             logger.debug("Prefetch: no results available")
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))

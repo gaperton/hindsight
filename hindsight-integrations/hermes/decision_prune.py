@@ -78,6 +78,36 @@ def keep_question(memory: str) -> str:
     return f"{KEEP_INSTRUCTIONS}\n\nMemory: {memory}"
 
 
+def ask_nouls(
+    url: str, api_key: str, model: str, state: str, instructions: dict[str, str], timeout_s: float
+) -> dict[str, float]:
+    """One System One request of plain-text noul questions -> {question key: noul in [0, 1]}.
+
+    Shared by this gate and the pre-recall cue gate (recall_skip.py). Raises on any failure,
+    including an answer with no usable noul; the callers decide how to fail open.
+    """
+    body = {
+        "model": model,
+        "state": state,
+        "questions": {key: {"type": "noul", "instructions": text} for key, text in instructions.items()},
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        payload = json.loads(response.read().decode())
+    answers: dict[str, float] = {}
+    for key, answer in (payload.get("answers") or {}).items():
+        noul = (answer or {}).get("noul")
+        if isinstance(noul, (int, float)):
+            answers[key] = max(0.0, min(1.0, float(noul)))
+    if not answers:
+        raise ValueError("decision model returned no noul answers")
+    return answers
+
+
 class DecisionPruner:
     """Asks System One keep-questions over a recall block and drops the losers."""
 
@@ -149,29 +179,8 @@ class DecisionPruner:
 
     def _ask(self, state: str, questions: dict[str, str]) -> dict[str, float]:
         """One System One request -> {question key: noul}. Raises on any failure."""
-        body = {
-            "model": self.model,
-            "state": state,
-            "questions": {
-                key: {"type": "noul", "instructions": keep_question(memory)}
-                for key, memory in questions.items()
-            },
-        }
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-            payload = json.loads(response.read().decode())
-        answers: dict[str, float] = {}
-        for key, answer in (payload.get("answers") or {}).items():
-            noul = (answer or {}).get("noul")
-            if isinstance(noul, (int, float)):
-                answers[key] = max(0.0, min(1.0, float(noul)))
-        if not answers:
-            raise ValueError("decision model returned no noul answers")
-        return answers
+        instructions = {key: keep_question(memory) for key, memory in questions.items()}
+        return ask_nouls(self.url, self.api_key, self.model, state, instructions, self.timeout_s)
 
     def _ask_oversized(self, state: str, questions: dict[str, str]) -> dict[str, float]:
         """``_ask``, retrying an over-window request in two halves (the daemon's shape).

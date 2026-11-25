@@ -25,6 +25,8 @@ class RecallReport:
     pruned: int | None = None
     prune_ms: float | None = None
     prune_skipped: str | None = None
+    #: The cue gate's noul when it skipped the recall (recall_skip.py); then nothing was searched.
+    skipped_no_cue: float | None = None
 
     def _stages(self) -> list[str]:
         stages = [f"{self.found} found"]
@@ -45,6 +47,8 @@ class RecallReport:
 
     def log_line(self) -> str:
         """One INFO line per recall, including the turns the indicator cannot show (empty block)."""
+        if self.skipped_no_cue is not None:
+            return f"recall: skipped, the message has no cue (p={self.skipped_no_cue:.2f})"
         if not self.found:
             return "recall: nothing found"
         outcome = f"{self.injected} injected" if self.injected else "nothing injected (block empty)"

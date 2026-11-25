@@ -124,5 +124,13 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             env_key="HINDSIGHT_RECALL_PRUNE_API_KEY",
             group="Recall pruning",
         ),
+        ProviderField(
+            key="recall_skip_no_cue",
+            label="Skip recall without cues",
+            kind=KIND_BOOL,
+            default=False,
+            group="Recall pruning",
+            description="Before recall, ask the same decision model whether the message names anything to recall by; skip the search when it names nothing.",
+        ),
     ),
 )
