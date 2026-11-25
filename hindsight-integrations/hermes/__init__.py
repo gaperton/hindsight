@@ -52,6 +52,11 @@ from .embedded import (
     _start_daemon,
     _stop_daemon,
 )
+from .decision_prune import DecisionPruner, PruneResult
+from .recall_skip import CueGate
+from .recall_audit import RecallAudit
+from .recall_report import RecallReport
+from .session_journal import RecallJournal
 from .settings import (
     _DEFAULT_API_URL,
     _DEFAULT_IDLE_TIMEOUT,
@@ -447,6 +452,8 @@ def _load_config() -> dict:
         "retain_indicator": _scoped_flag("HINDSIGHT_RETAIN_INDICATOR", True),
         "recall_indicator": _scoped_flag("HINDSIGHT_RECALL_INDICATOR", True),
         "recall_sync": _scoped_flag("HINDSIGHT_RECALL_SYNC", False),
+        "recall_session_dedup": _scoped_flag("HINDSIGHT_RECALL_SESSION_DEDUP", True),
+        "recall_audit": _scoped_flag("HINDSIGHT_RECALL_AUDIT", True),
         "banks": {
             "hermes": {
                 "bankId": get_secret("HINDSIGHT_BANK_ID", "") or "hermes",
@@ -522,6 +529,19 @@ _SYSTEM_PROMPT_TAILS = {
 }
 
 
+def _recall_report(found: int, kept: list, already_shown: int | None, outcome: PruneResult | None) -> RecallReport:
+    """What one recall's stages did, for the indicator and the log."""
+    graded = outcome is not None and outcome.graded
+    return RecallReport(
+        found=found,
+        injected=len(kept),
+        already_shown=already_shown,
+        pruned=len(outcome.dropped) if graded else None,
+        prune_ms=outcome.elapsed_ms if graded else None,
+        prune_skipped=outcome.skipped if outcome is not None else None,
+    )
+
+
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
@@ -531,7 +551,9 @@ class HindsightMemoryProvider(MemoryProvider):
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
         with contextlib.suppress(Exception):
-            return [str(Path.home() / ".hindsight")]
+            paths = [str(Path.home() / ".hindsight")]
+            paths.append(str(Path(get_hermes_home()) / "hindsight" / "recall_journal.sqlite3"))
+            return paths
         return []
 
     def __init__(self):
@@ -593,8 +615,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._append_unsupported = False
         self._apply_retain_policy({})
 
-        # Recall: pending prefetch block + count, and the indicator state (recall_status()).
-        self._prefetch_result, self._prefetch_count = "", 0
+        # Recall: pending prefetch block + its report, and the indicator state (recall_status()).
+        self._prefetch_result, self._prefetch_report = "", None
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Bumped by every new prefetch, session switch and shutdown: a worker writes its result
@@ -602,6 +624,12 @@ class HindsightMemoryProvider(MemoryProvider):
         # land in the next session.
         self._prefetch_generation = 0
         self._last_recall_returned, self._last_recall_count = False, 0
+        self._last_recall_report: RecallReport | None = None
+        # Session-scoped recall dedup: flag set by _apply_recall_settings, journal opened in initialize().
+        self._session_dedup = True
+        self._journal = None
+        # Per-request recall audit trail: same DB, opened alongside the journal in initialize().
+        self._audit_enabled, self._audit_max_rows, self._audit = True, 1000, None
         self._apply_recall_settings({})
 
     @property
@@ -839,6 +867,32 @@ class HindsightMemoryProvider(MemoryProvider):
                 "key": "recall_min_scores",
                 "description": 'Minimum relevance per score field, as a JSON object (e.g. {"reranker": 0.25}). Recall always returns up to recall_max_tokens of the best-ranked memories even when none is relevant; memories under a floor are dropped from auto-recall and the hindsight_recall tool, so an off-topic turn injects nothing. Default: no floor',
                 "default": "",
+            },
+            {
+                "key": "recall_prune",
+                "description": "Recall pruning: after recall, ask a separate decision model which memories help answer the turn and drop the rest. Off by default; needs the three settings below.",
+                "default": False,
+            },
+            {
+                "key": "recall_prune_base_url",
+                "description": "Recall pruning endpoint (a System One server; the plugin calls <url>/v1/systemone)",
+                "default": "",
+            },
+            {
+                "key": "recall_prune_model",
+                "description": "Recall pruning model, independent of the Hindsight server's own decision model",
+                "default": "",
+            },
+            {
+                "key": "recall_prune_api_key",
+                "description": "Recall pruning endpoint API key",
+                "secret": True,
+                "env_var": "HINDSIGHT_RECALL_PRUNE_API_KEY",
+            },
+            {
+                "key": "recall_skip_no_cue",
+                "description": "Before recall, ask the recall pruning model whether the message names anything concrete to recall by, and skip the search when it does not (ok, go ahead, the second one). Off by default; uses the recall pruning endpoint, model and key.",
+                "default": False,
             },
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {
@@ -1357,6 +1411,31 @@ class HindsightMemoryProvider(MemoryProvider):
         self._apply_connection_settings(cfg)
         self._apply_retain_settings(cfg)
         self._apply_recall_settings(cfg)
+        # Session-scoped recall dedup: open the journal; make the message counter durable across
+        # a restart of the same session (Hermes core exposes no message index to providers).
+        # The audit trail shares the journal DB but opens independently: either one works
+        # without the other, and neither failing blocks the other.
+        self._journal = None
+        self._audit = None
+        if self._session_id:
+            journal_path = None
+            with contextlib.suppress(Exception):
+                journal_path = Path(kwargs.get("hermes_home") or get_hermes_home()) / "hindsight" / "recall_journal.sqlite3"
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+            if journal_path is not None:
+                if self._session_dedup:
+                    try:
+                        self._journal = RecallJournal(journal_path)
+                        self._turn_counter = max(self._turn_counter, self._journal.max_message_no(self._session_id))
+                    except Exception as exc:  # fail OPEN: bookkeeping must never cost a recall
+                        logger.warning("Recall session-dedup disabled (journal unavailable): %s", exc)
+                        self._journal = None
+                if self._audit_enabled:
+                    try:
+                        self._audit = RecallAudit(journal_path, max_rows=self._audit_max_rows)
+                    except Exception as exc:  # fail OPEN: the audit trail never costs a recall
+                        logger.warning("Recall audit disabled (audit table unavailable): %s", exc)
+                        self._audit = None
 
         client_version = "unknown"
         with contextlib.suppress(Exception):
@@ -1613,6 +1692,13 @@ class HindsightMemoryProvider(MemoryProvider):
         # ~4k tokens of unrelated memories (#6145). recall_cron opts back in; the tools still work.
         cron_skip = getattr(self, "_agent_context", "primary") == "cron" and not cfg.get("recall_cron", False)
         self._auto_recall = cfg.get("auto_recall", True) and not cron_skip
+        # Cross-turn dedup of automatic recall within one session (see session_journal.py).
+        self._session_dedup = bool(cfg.get("recall_session_dedup", True))
+        # Per-request recall audit trail (see recall_audit.py): the query, the injected block
+        # and every returned item's fate, one row per recall in the journal DB. On by default;
+        # HINDSIGHT_RECALL_AUDIT=false is the kill switch (env rides in as the config default).
+        self._audit_enabled = bool(cfg.get("recall_audit", True))
+        self._audit_max_rows = _parse_int_setting(cfg.get("recall_audit_max_rows"), 1000)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = _parse_int_setting(cfg.get("recall_max_tokens"), 4096)
         self._recall_max_input_chars = _parse_int_setting(cfg.get("recall_max_input_chars"), 800)
@@ -1626,6 +1712,29 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
         self._recall_min_scores = _normalize_min_scores(cfg.get("recall_min_scores"))
+        # Post-recall relevance gate (see decision_prune.py): an opt-in System One pass that
+        # drops items judged no help for the query — filtering only, the daemon's ranking
+        # passes through untouched. Fails open everywhere: an unusable or unreachable gate
+        # costs verdicts, never memories.
+        # Its own model and endpoint (recall_prune_*), independent of the server's decision model.
+        self._pruner = None
+        # HINDSIGHT_RECALL_PRUNE=true/false overrides the config switch without an edit.
+        if _scoped_flag("HINDSIGHT_RECALL_PRUNE", default=bool(cfg.get("recall_prune", False))):
+            prune_key = cfg.get("recall_prune_api_key") or get_secret("HINDSIGHT_RECALL_PRUNE_API_KEY", "")
+            try:
+                self._pruner = DecisionPruner.from_config(cfg, prune_key)
+            except ValueError as exc:
+                logger.warning("recall_prune enabled but unusable (%s); gate disabled", exc)
+        # Pre-recall cue gate (see recall_skip.py): an opt-in question before the search that skips
+        # the recall when the message names nothing to recall by. Shares the relevance gate's
+        # endpoint and key (whether or not pruning itself is on); fails open like it.
+        self._cue_gate = None
+        if cfg.get("recall_skip_no_cue", False):
+            gate_key = cfg.get("recall_prune_api_key") or get_secret("HINDSIGHT_RECALL_PRUNE_API_KEY", "")
+            try:
+                self._cue_gate = CueGate.from_config(cfg, gate_key)
+            except ValueError as exc:
+                logger.warning("recall_skip_no_cue enabled but unusable (%s); recalling every turn", exc)
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -1808,33 +1917,138 @@ class HindsightMemoryProvider(MemoryProvider):
             raise
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, *, message_no: int | None = None) -> tuple[str, RecallReport | None]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
-        -> (text, memory count); the count is 0 for reflect (synthesis) and on error, where the text
-        is ``_RECALL_FAILED_NOTE``."""
+        -> (text, what each stage did); the report is None on error, where the text is
+        ``_RECALL_FAILED_NOTE``, and counts nothing for a reflect (a synthesis has no items).
+        ``message_no`` is the session position the block will attach to (journal).
+        Each call writes one audit row (see recall_audit.py); the reflect path is not
+        audited (synthesized prose, no items to tag). The cue gate asks first, on the whole
+        message, and a message with no cue skips the search (audited as ``recall-skipped``)."""
+        started = time.perf_counter()
+        verdict = self._cue_gate.judge(query) if self._cue_gate is not None else None
+        cue_noul = verdict.noul if verdict is not None else None
         if self._recall_max_input_chars:
             query = query[: self._recall_max_input_chars]
+        msg_no = self._turn_counter + 1 if message_no is None else message_no
+        if verdict is not None and verdict.skip:
+            report = RecallReport(found=0, injected=0, skipped_no_cue=cue_noul)
+            logger.info("Hindsight %s", report.log_line())
+            self._audit_recall(query, msg_no, [], [], None, report, started, cue_noul=cue_noul)
+            return "", report
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                return self._reflect(query) or "", 0
+                return self._reflect(query) or "", RecallReport(found=0, injected=0)
             logger.debug(
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
-            results = self._recall(query)
-            logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
+            raw = self._recall(query)
+            found = len(raw)
+            results = raw
+            journal_dropped: list[tuple[object, str]] = []
+            already_shown = None
+            if self._journal is not None:
+                try:
+                    results, journal_dropped = self._journal.filter_and_record(self._session_id, results, msg_no)
+                    already_shown = len(journal_dropped)
+                except Exception as exc:  # fail OPEN
+                    logger.warning("Recall session-dedup skipped this turn (journal error): %s", exc)
+            # Relevance gate, last filter before the block is rendered: drop what the
+            # decision model judges no help. No backfill — the block shrinks by exactly
+            # what was dropped. A dropped item is un-journaled (its row is this turn's):
+            # it was never shown, and the next turn's query may grade it keep again.
+            outcome = self._gate(query, results)
+            if outcome is not None:
+                results = outcome.kept
+                if outcome.dropped and self._journal is not None:
+                    self._journal.unrecord(self._session_id, outcome.dropped, msg_no)
+            report = _recall_report(found, results, already_shown, outcome)
+            logger.info("Hindsight %s", report.log_line())
+            self._audit_recall(query, msg_no, raw, journal_dropped, outcome, report, started, cue_noul=cue_noul)
+            return "\n".join(f"- {r.text}" for r in results if r.text), report
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
+            self._audit_recall(query, msg_no, [], [], None, None, started, error=str(e), cue_noul=cue_noul)
             return _RECALL_FAILED_NOTE, 0
 
-    def _finish_prefetch(self, result: str, count: int) -> str:
+    def _audit_recall(
+        self, query, message_no, raw, journal_dropped, outcome, report, started, *, error=None, cue_noul=None
+    ) -> None:
+        """One audit row per request: the query, one count per phase
+        (``n_found = n_duplicated + n_pruned + n_injected``), and every returned item
+        tagged with its fate. Item identity is the live object — every list here holds
+        its refs, so ``id()`` is a stable key for the call. Fail OPEN: a broken write
+        costs the row, not the recall."""
+        if self._audit is None:
+            return
+        try:
+            fate: dict[int, tuple[str, float | None]] = {id(item): (reason, None) for item, reason in journal_dropped}
+            gate_status, n_pruned, floor = "off", 0, None
+            if report is not None and report.skipped_no_cue is not None:
+                gate_status = "recall-skipped"
+            elif outcome is not None:
+                gate_status = "graded" if outcome.graded else (f"skipped:{outcome.skipped}" if outcome.skipped else "too-few")
+                if outcome.graded:
+                    n_pruned, floor = len(outcome.dropped), outcome.floor
+                    nouls = outcome.dropped_nouls
+                    for index, item in enumerate(outcome.dropped):
+                        fate[id(item)] = ("pruned", nouls[index] if index < len(nouls) else None)
+            items = []
+            for r in raw:
+                stage, noul = fate.get(id(r), ("injected", None))
+                items.append({
+                    "uid": (str(r.id) if getattr(r, "id", None) else None),
+                    "text": r.text or "",
+                    "stage": stage,
+                    "noul": noul,
+                })
+            self._audit.record(
+                session_id=self._session_id,
+                message_no=message_no,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                query=query,
+                n_found=len(raw),
+                n_duplicated=len(journal_dropped),
+                n_pruned=n_pruned,
+                n_injected=report.injected if report is not None else 0,
+                gate_status=gate_status,
+                prune_floor=floor,
+                items=items,
+                error=error,
+                cue_noul=cue_noul,
+            )
+        except Exception as exc:  # the audit trail is never worth a lost recall
+            logger.warning("recall audit skipped: %s", exc)
+
+    def _gate(self, query: str, results: list) -> PruneResult | None:
+        """The relevance gate over *results* (None when it is off or there is nothing to grade).
+        Fails open: an exception keeps every item and says so in ``skipped``."""
+        if self._pruner is None or not results:
+            return None
+        try:
+            return self._pruner.prune(query, results, current_date=_hermes_now().date().isoformat())
+        except Exception as exc:  # the gate never costs memories
+            logger.warning("recall prune skipped: %s", exc)
+            return PruneResult(list(results), [], False, f"error: {type(exc).__name__}", 0.0)
+
+    def _finish_prefetch(self, result: str, report: RecallReport | None) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
         if result == _RECALL_FAILED_NOTE:
-            self._last_recall_returned, self._last_recall_count = False, 0
+            self._last_recall_returned, self._last_recall_count, self._last_recall_report = False, 0, None
             return result
-        self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
+        injected = report.injected if (result and report is not None) else 0
+        self._last_recall_returned, self._last_recall_count = bool(result), injected
+        self._last_recall_report = report if result else None
         if not result:
+            # Hermes shows its recall indicator only when a block is injected, so a turn the
+            # gate emptied would pass in silence; the CLI's status channel can still say so.
+            if report is not None and report.empty_after_prune() and self._recall_indicator:
+                self._emit_status_line(f"{_HINDSIGHT_GLYPH} {report.indicator_label()} — nothing relevant to inject")
+            elif report is not None and report.skipped_no_cue is not None and self._recall_indicator:
+                self._emit_status_line(
+                    f"{_HINDSIGHT_GLYPH} Hindsight — recall skipped, nothing to recall by (p={report.skipped_no_cue:.2f})"
+                )
             logger.debug("Prefetch: no results available")
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
@@ -1857,19 +2071,31 @@ class HindsightMemoryProvider(MemoryProvider):
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
         if self._recall_sync:
-            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
+            return self._finish_prefetch(*(("", None) if self._recall_disabled() else self._do_recall(query, message_no=self._turn_counter + 1)))
         # Default: the background worker's result for the previous turn (capped join).
         self._join_prefetch(3.0, log=True)
         with self._prefetch_lock:
-            result, count = self._prefetch_result, self._prefetch_count
-            self._prefetch_result, self._prefetch_count = "", 0
-        return self._finish_prefetch(result, count)
+            result, report = self._prefetch_result, self._prefetch_report
+            self._prefetch_result, self._prefetch_report = "", None
+        return self._finish_prefetch(result, report)
+
+    def _emit_status_line(self, line: str) -> None:
+        """A model-independent status line (CLI only: Hermes wires status_callback there)."""
+        if self._status_callback is None:
+            return
+        try:
+            self._status_callback(line)
+        except Exception:
+            logger.debug("Status line emit failed (non-fatal)", exc_info=True)
 
     def recall_status(self) -> Optional[RecallStatus]:
-        """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
+        """What the last prefetch injected, stage by stage in the label; None if nothing was
+        injected or ``recall_indicator=false``."""
         if not self._recall_indicator or not self._last_recall_returned:
             return None
-        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
+        report = self._last_recall_report
+        label = report.indicator_label() if report is not None else "Hindsight"
+        return RecallStatus(provider_label=label, count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
@@ -1882,17 +2108,21 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             generation = self._prefetch_generation
+        # The block lands on the NEXT user message; capture the position now so a slow
+        # worker cannot stamp it with a newer turn's number.
+        message_no = self._turn_counter + 1
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
             # retain to be recall-visible so the warmed context includes it.
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query)
-            if text:
+            text, report = self._do_recall(query, message_no=message_no)
+            # An emptied block still carries its report, so the next turn can say why.
+            if text or report is not None:
                 with self._prefetch_lock:
                     if generation == self._prefetch_generation:
-                        self._prefetch_result, self._prefetch_count = text, count
+                        self._prefetch_result, self._prefetch_report = text, report
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2106,11 +2336,8 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         # Indicator fires only past every skip/buffer gate: solely on turns that persist.
         # Model-independent status line; no-op without retain_indicator/status channel.
-        if self._retain_indicator and self._status_callback is not None:
-            try:
-                self._status_callback(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
-            except Exception:
-                logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
+        if self._retain_indicator:
+            self._emit_status_line(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
         self._enqueue_retain(job)
         # Advance the watermark only after the delta is queued so a later retain
         # doesn't re-ship turns already handed to the writer.
@@ -2191,7 +2418,19 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
         results = self._recall(query)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
+        found = len(results)
+        # The relevance gate applies here too, graded against the model's own query: a tool
+        # answer stays in the transcript for the rest of the session, so its noise costs more
+        # than an automatic block's. Session dedup does NOT apply — the model asked explicitly.
+        outcome = self._gate(query, results)
+        if outcome is not None:
+            results = outcome.kept
+        if self._journal is not None:
+            # Mark-only, and only what the model actually received: the next automatic block
+            # must not re-ship it; a pruned item was never shown and may surface later.
+            with contextlib.suppress(Exception):
+                self._journal.record(self._session_id, results, self._turn_counter + 1)
+        logger.info("Hindsight tool %s", _recall_report(found, results, None, outcome).log_line())
         return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
 
     def _tool_reflect(self, args: dict) -> str:
